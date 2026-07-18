@@ -1,0 +1,56 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment and secrets
+.env
+*.env.local
+*.pem
+*.key
+credentials.json
+secrets.yaml
+!.env.example
+
+# IDE, OS, and local agent metadata
+.vscode/
+.idea/
+.agents/
+.codex/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Docker
+/docker-compose.override.yml
+
+# Data, uploads, and logs
+uploads/
+data/
+logs/
+runtime/
+*.log
+*.sqlite
+*.db
+
+# Local AI model weights and caches
+model_texttotext/
+model_embedding/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+frontend/tsconfig.tsbuildinfo
