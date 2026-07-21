@@ -95,19 +95,20 @@ class EducationAgent:
         self._register_skills()
 
     async def answer(self, question: str, session_id: str = DEFAULT_SESSION_ID, **kwargs: Any) -> EducationAgentResult:
-        history_text = conversation_memory.format_history(session_id=session_id)
-        skill_name = await self._route_with_llm(question, history_text)
-        skill_result = await self._run_skill_safely(skill_name, question, **kwargs)
-        answer = await self._generate_final_answer(question, skill_name, skill_result, history_text)
-        conversation_memory.append_turn(
-            question=question,
-            answer=answer,
-            session_id=session_id,
-            metadata={"agent": "education", "skill": skill_name},
-        )
-        return self._build_result(question, skill_name, skill_result, answer)
+        history_text = self.load_history(session_id=session_id)
+        skill_name = await self.route_question(question, history_text)
+        skill_result = await self.run_skill(skill_name, question, **kwargs)
+        answer = await self.generate_final_answer(question, skill_name, skill_result, history_text)
+        self.save_memory(question, answer, skill_name, session_id=session_id)
+        return self.build_result(question, skill_name, skill_result, answer)
 
-    async def _run_skill_safely(self, skill_name: str, question: str, **kwargs: Any) -> SkillResult:
+    def load_history(self, session_id: str = DEFAULT_SESSION_ID) -> str:
+        return conversation_memory.format_history(session_id=session_id)
+
+    async def route_question(self, question: str, history_text: str = "") -> str:
+        return await self._route_with_llm(question, history_text)
+
+    async def run_skill(self, skill_name: str, question: str, **kwargs: Any) -> SkillResult:
         try:
             skill = get_skill(skill_name)
             return await skill.arun(question=question, **kwargs)
@@ -122,7 +123,7 @@ class EducationAgent:
                 metadata={"skill": skill_name, "fallback_reason": "skill_or_tool_failed"},
             )
 
-    async def _generate_final_answer(
+    async def generate_final_answer(
         self,
         question: str,
         skill_name: str,
@@ -154,6 +155,41 @@ class EducationAgent:
             HumanMessage(content=user_prompt),
         ])
         return str(response.content)
+
+    def save_memory(
+        self,
+        question: str,
+        answer: str,
+        skill_name: str,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> None:
+        conversation_memory.append_turn(
+            question=question,
+            answer=answer,
+            session_id=session_id,
+            metadata={"agent": "education", "skill": skill_name},
+        )
+
+    def build_result(
+        self,
+        question: str,
+        skill_name: str,
+        skill_result: SkillResult,
+        answer: str,
+    ) -> EducationAgentResult:
+        return self._build_result(question, skill_name, skill_result, answer)
+
+    async def _run_skill_safely(self, skill_name: str, question: str, **kwargs: Any) -> SkillResult:
+        return await self.run_skill(skill_name, question, **kwargs)
+
+    async def _generate_final_answer(
+        self,
+        question: str,
+        skill_name: str,
+        skill_result: SkillResult,
+        history_text: str = "",
+    ) -> str:
+        return await self.generate_final_answer(question, skill_name, skill_result, history_text)
 
     @staticmethod
     def _format_context(skill_result: SkillResult) -> str:
@@ -270,5 +306,6 @@ class EducationAgent:
             data=skill_result.data if isinstance(skill_result.data, dict) else {"result": skill_result.data},
             metadata=metadata,
         )
+
 
 
