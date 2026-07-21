@@ -118,7 +118,7 @@ class QAAgent:
 
     async def answer(self, question: str, session_id: str = DEFAULT_SESSION_ID) -> QAResult:
         """完整问答流程"""
-        history_text = conversation_memory.format_history(session_id=session_id)
+        history_text = conversation_memory.format_history_with_short_memory(session_id=session_id)
 
         try:
             intent = await self._classify_intent(question)
@@ -143,6 +143,30 @@ class QAAgent:
             session_id=session_id,
             metadata={"agent": "qa", "intent": intent.value},
         )
+        conversation_memory.append_record(
+            question=question,
+            answer=answer_text,
+            agent="qa",
+            session_id=session_id,
+            metadata={
+                "intent": intent.value,
+                "tools_used": [],
+                "sources": [
+                    {
+                        "content": context.content[:200],
+                        "source": context.source,
+                        "score": context.score,
+                        "type": context.retrieval_type,
+                    }
+                    for context in top_contexts
+                ],
+                "confidence": self._calc_confidence(top_contexts),
+                "reasoning_steps": reasoning,
+            },
+        )
+
+        await conversation_memory.refresh_short_memory(session_id=session_id)
+        await conversation_memory.refresh_long_memory(session_id=session_id)
 
         return QAResult(
             question=question,
@@ -324,3 +348,6 @@ class QAAgent:
         if start >= 0 and end >= start:
             cleaned = cleaned[start : end + 1]
         return cleaned.strip()
+
+
+

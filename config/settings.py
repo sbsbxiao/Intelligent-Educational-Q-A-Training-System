@@ -41,7 +41,13 @@ class Settings(BaseSettings):
 
     # Conversation Memory
     conversation_history_file: str = Field(default="./runtime/conversation_history.json", validation_alias="CONVERSATION_HISTORY_FILE")
+    conversation_records_file: str = Field(default="./runtime/conversation_records.json", validation_alias="CONVERSATION_RECORDS_FILE")
+    short_memory_file: str = Field(default="./runtime/short_memory.json", validation_alias="SHORT_MEMORY_FILE")
+    long_memory_file: str = Field(default="./runtime/long_memory.json", validation_alias="LONG_MEMORY_FILE")
     max_history_messages: int = Field(default=10, validation_alias="MAX_HISTORY_MESSAGES")
+    max_conversation_records: int = Field(default=25, validation_alias="MAX_CONVERSATION_RECORDS")
+    max_short_memory_items: int = Field(default=5, validation_alias="MAX_SHORT_MEMORY_ITEMS")
+    max_long_memory_items: int = Field(default=10, validation_alias="MAX_LONG_MEMORY_ITEMS")
 
     # Local Text Generation Model
     local_text_generation_path: str = Field(default="", validation_alias="LOCAL_TEXT_GENERATION_PATH")
@@ -51,4 +57,5 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
 

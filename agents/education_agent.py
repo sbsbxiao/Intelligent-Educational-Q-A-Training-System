@@ -100,10 +100,14 @@ class EducationAgent:
         skill_result = await self.run_skill(skill_name, question, **kwargs)
         answer = await self.generate_final_answer(question, skill_name, skill_result, history_text)
         self.save_memory(question, answer, skill_name, session_id=session_id)
-        return self.build_result(question, skill_name, skill_result, answer)
+        result = self.build_result(question, skill_name, skill_result, answer)
+        self.save_record(question, answer, skill_name, skill_result, session_id=session_id)
+        await conversation_memory.refresh_short_memory(session_id=session_id)
+        await conversation_memory.refresh_long_memory(session_id=session_id)
+        return result
 
     def load_history(self, session_id: str = DEFAULT_SESSION_ID) -> str:
-        return conversation_memory.format_history(session_id=session_id)
+        return conversation_memory.format_history_with_short_memory(session_id=session_id)
 
     async def route_question(self, question: str, history_text: str = "") -> str:
         return await self._route_with_llm(question, history_text)
@@ -170,6 +174,28 @@ class EducationAgent:
             metadata={"agent": "education", "skill": skill_name},
         )
 
+
+    def save_record(
+        self,
+        question: str,
+        answer: str,
+        skill_name: str,
+        skill_result: SkillResult,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> None:
+        conversation_memory.append_record(
+            question=question,
+            answer=answer,
+            agent="education",
+            session_id=session_id,
+            metadata={
+                "skill": skill_name,
+                "tools_used": skill_result.tools_used,
+                "sources": skill_result.sources,
+                "success": skill_result.success,
+                "error": skill_result.error,
+            },
+        )
     def build_result(
         self,
         question: str,
@@ -306,6 +332,9 @@ class EducationAgent:
             data=skill_result.data if isinstance(skill_result.data, dict) else {"result": skill_result.data},
             metadata=metadata,
         )
+
+
+
 
 
 

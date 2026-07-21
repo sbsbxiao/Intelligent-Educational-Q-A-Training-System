@@ -15,6 +15,7 @@ from agents.knowledge_update_agent import DocumentChange, KnowledgeUpdateAgent, 
 from agents.qa_agent import QAAgent, QAResult
 from services.knowledge_graph import KnowledgeGraphService
 from services.vector_store import VectorStoreService
+from services.conversation_memory import conversation_memory
 from skills.base import SkillResult
 from tools.registry import get_tool
 
@@ -268,7 +269,7 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
 
         question = state.get("question", "")
         next_state = dict(state)
-        next_state.setdefault("history_text", education_agent.load_history())
+        next_state.setdefault("history_text", education_agent.load_history(session_id=state.get("session_id", "default")))
         next_state.setdefault("plan_type", _detect_plan_type(question))
         next_state.setdefault("thoughts", [])
         next_state.setdefault("actions", [])
@@ -399,6 +400,12 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
         history_text = state.get("history_text", "")
         answer = await education_agent.generate_final_answer(question, skill_name, skill_result, history_text)
         result = education_agent.build_result(question, skill_name, skill_result, answer)
+        session_id = state.get("session_id", "default")
+        education_agent.save_memory(question, answer, skill_name, session_id=session_id)
+        education_agent.save_record(question, answer, skill_name, skill_result, session_id=session_id)
+
+        await conversation_memory.refresh_short_memory(session_id=session_id)
+        await conversation_memory.refresh_long_memory(session_id=session_id)
 
         next_state = dict(state)
         next_state["answer"] = answer
@@ -490,6 +497,8 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
     graph.add_edge("retry", END)
 
     return graph.compile()
+
+
 
 
 
