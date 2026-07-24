@@ -15,6 +15,7 @@ from config import settings
 from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from services.local_text_generation import create_local_text_generation_model
 from services.query_understanding import QueryUnderstandingChains
+from services.retrievers import GraphKnowledgeRetriever, HybridKnowledgeRetriever, VectorKnowledgeRetriever
 
 
 class QueryIntent(str, Enum):
@@ -43,18 +44,6 @@ class QAResult:
     confidence: float
     reasoning_steps: list[str] = field(default_factory=list)
 
-
-CYPHER_GENERATION_PROMPT = """\
-你是一个 Neo4j Cypher 查询生成专家。根据用户问题和提取的实体，生成 Cypher 查询。
-
-知识图谱 Schema:
-- 节点标签: Person, Organization, Technology, Product, Concept, Location
-- 关系类型: belongs_to, works_at, located_in, developed_by, related_to, part_of, uses, depends_on
-- 节点属性: name, type, description, created_at, version
-
-生成 1-2 条 Cypher 查询，返回 JSON: {"queries": ["MATCH ...", "MATCH ..."]}
-只返回 JSON，不要其他文字。
-"""
 
 ANSWER_PROMPT = """\
 你是一个专业的企业知识问答助手。根据检索到的上下文信息回答用户问题。
@@ -86,6 +75,28 @@ class QAAgent:
         self.knowledge_graph = knowledge_graph
         self.local_llm = create_local_text_generation_model()
         self.query_understanding = QueryUnderstandingChains(llm=self.llm)
+        self.vector_retriever = (
+            VectorKnowledgeRetriever(vector_store=self.vector_store, top_k=5)
+            if self.vector_store
+            else None
+        )
+        self.graph_retriever = (
+            GraphKnowledgeRetriever(
+                knowledge_graph=self.knowledge_graph,
+                local_llm=self.local_llm,
+                top_k=5,
+            )
+            if self.knowledge_graph
+            else None
+        )
+        self.hybrid_retriever = (
+            HybridKnowledgeRetriever(
+                vector_retriever=self.vector_retriever,
+                graph_retriever=self.graph_retriever,
+            )
+            if self.vector_retriever
+            else None
+        )
 
     async def answer(self, question: str, session_id: str = DEFAULT_SESSION_ID) -> QAResult:
         history_text = conversation_memory.format_history_with_short_memory(session_id=session_id)
@@ -100,11 +111,7 @@ class QAAgent:
         except Exception:
             rewritten = {"queries": [question], "entities": [], "keywords": []}
 
-        vector_contexts = await self._vector_retrieve(rewritten)
-        graph_contexts = await self._graph_retrieve(question, rewritten)
-
-        all_contexts = self._hybrid_rerank(vector_contexts + graph_contexts)
-        top_contexts = all_contexts[:8]
+        top_contexts = await self._retrieve_contexts(question, rewritten)
 
         answer_text, reasoning = await self._generate_answer(question, top_contexts, intent, history_text)
         conversation_memory.append_turn(
@@ -163,75 +170,34 @@ class QAAgent:
             "keywords": rewritten.keywords,
         }
 
-    async def _vector_retrieve(self, rewritten: dict) -> list[RetrievedContext]:
-        if not self.vector_store:
+    async def _retrieve_contexts(self, question: str, rewritten: dict[str, Any]) -> list[RetrievedContext]:
+        if not self.hybrid_retriever:
             return []
 
-        contexts: list[RetrievedContext] = []
-        for query in rewritten.get("queries", []):
-            try:
-                results = await self.vector_store.search(query, top_k=5)
-            except Exception:
-                continue
-            for doc, score in results:
-                contexts.append(RetrievedContext(
-                    content=doc.get("content", ""),
-                    source=doc.get("source", "vector_store"),
-                    score=score,
-                    retrieval_type="vector",
-                    metadata=doc.get("metadata", {}),
-                ))
-        return contexts
-
-    async def _graph_retrieve(self, question: str, rewritten: dict) -> list[RetrievedContext]:
-        if not self.knowledge_graph:
-            return []
-
-        import json
-
-        entities = rewritten.get("entities", [])
         try:
-            raw = await self.local_llm.agenerate(
-                CYPHER_GENERATION_PROMPT,
-                f"问题: {question}\n实体: {entities}",
+            documents = await self.hybrid_retriever.ainvoke(
+                {
+                    "question": question,
+                    "queries": rewritten.get("queries", []),
+                    "entities": rewritten.get("entities", []),
+                }
             )
-            cleaned = self._clean_json_text(raw)
-            cypher_data = json.loads(cleaned)
         except Exception:
-            cypher_data = {"queries": []}
+            return []
 
         contexts: list[RetrievedContext] = []
-        for cypher in cypher_data.get("queries", []):
-            try:
-                records = await self.knowledge_graph.execute_cypher(cypher)
-                for record in records:
-                    contexts.append(RetrievedContext(
-                        content=str(record),
-                        source="knowledge_graph",
-                        score=0.8,
-                        retrieval_type="graph",
-                        metadata={"cypher": cypher},
-                    ))
-            except Exception:
-                continue
+        for document in documents[:8]:
+            metadata = dict(document.metadata)
+            contexts.append(
+                RetrievedContext(
+                    content=document.page_content,
+                    source=str(metadata.get("source", "")),
+                    score=float(metadata.get("score", 0.0)),
+                    retrieval_type=str(metadata.get("retrieval_type", "vector")),
+                    metadata=metadata,
+                )
+            )
         return contexts
-
-    @staticmethod
-    def _hybrid_rerank(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
-        weight_map = {"vector": 1.0, "graph": 1.2, "hybrid": 1.1}
-        for ctx in contexts:
-            ctx.score *= weight_map.get(ctx.retrieval_type, 1.0)
-
-        seen: set[str] = set()
-        unique: list[RetrievedContext] = []
-        for ctx in contexts:
-            key = ctx.content[:100]
-            if key not in seen:
-                seen.add(key)
-                unique.append(ctx)
-
-        unique.sort(key=lambda c: c.score, reverse=True)
-        return unique
 
     async def _generate_answer(
         self,
@@ -282,14 +248,3 @@ class QAAgent:
             return 0.0
         avg_score = sum(c.score for c in contexts) / len(contexts)
         return min(avg_score, 1.0)
-
-    @staticmethod
-    def _clean_json_text(raw: str) -> str:
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start >= 0 and end >= start:
-            cleaned = cleaned[start : end + 1]
-        return cleaned.strip()
