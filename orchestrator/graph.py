@@ -501,39 +501,76 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
         ]
         return next_state
 
-    async def act(state: dict) -> dict:
-        if not education_agent:
-            raise RuntimeError("Plan ReAct workflow requires education_agent")
-
+    async def select_executor(state: dict) -> dict:
         action = (state.get("actions") or [{}])[-1]
         action_type = action.get("type", "skill")
         action_name = action.get("name", "study_plan")
         action_input = action.get("input", {})
         question = action_input.get("question") or state.get("question", "")
 
-        if action_type == "tool":
-            try:
-                tool = get_tool(action_name)
-                tool_result = await tool.arun(**action_input)
-                skill_result = SkillResult(
-                    success=tool_result.success,
-                    data=tool_result.data,
-                    tools_used=[tool.name],
-                    sources=[],
-                    error=tool_result.error,
-                    metadata=tool_result.metadata,
-                )
-            except Exception as exc:
-                skill_result = SkillResult(
-                    success=False,
-                    data={},
-                    tools_used=[action_name],
-                    sources=[],
-                    error=str(exc),
-                    metadata={"fallback_reason": "tool_failed"},
-                )
-        else:
-            skill_result = await education_agent.run_skill(action_name, question)
+        next_state = dict(state)
+        next_state["action_type"] = action_type
+        next_state["action_name"] = action_name
+        next_state["action_input"] = action_input
+        next_state["action_question"] = question
+        return next_state
+
+    def route_executor(state: dict) -> str:
+        if state.get("action_type", "skill") == "tool":
+            return "run_tool"
+        return "run_skill"
+
+    async def run_tool_action(state: dict) -> dict:
+        action_name = state.get("action_name", "")
+        action_input = state.get("action_input", {})
+        try:
+            tool = get_tool(action_name)
+            tool_result = await tool.arun(**action_input)
+            raw_result = SkillResult(
+                success=tool_result.success,
+                data=tool_result.data,
+                tools_used=[tool.name],
+                sources=[],
+                error=tool_result.error,
+                metadata=tool_result.metadata,
+            )
+        except Exception as exc:
+            raw_result = SkillResult(
+                success=False,
+                data={},
+                tools_used=[action_name],
+                sources=[],
+                error=str(exc),
+                metadata={"fallback_reason": "tool_failed"},
+            )
+
+        next_state = dict(state)
+        next_state["raw_action_result"] = raw_result
+        return next_state
+
+    async def run_skill_action(state: dict) -> dict:
+        if not education_agent:
+            raise RuntimeError("Plan ReAct workflow requires education_agent")
+
+        action_name = state.get("action_name", "study_plan")
+        question = state.get("action_question", state.get("question", ""))
+        raw_result = await education_agent.run_skill(action_name, question)
+
+        next_state = dict(state)
+        next_state["raw_action_result"] = raw_result
+        return next_state
+
+    async def normalize_result(state: dict) -> dict:
+        skill_result = state.get("raw_action_result")
+        if not isinstance(skill_result, SkillResult):
+            skill_result = SkillResult(
+                success=False,
+                data={},
+                tools_used=[],
+                sources=[],
+                error="invalid_action_result",
+                metadata={"fallback_reason": "normalize_failed"},
+            )
 
         next_state = dict(state)
         next_state["skill_result"] = skill_result
@@ -612,7 +649,10 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
     graph.add_node("validate_skill", validate_skill)
     graph.add_node("fallback_route", fallback_route)
     graph.add_node("prepare_action", prepare_action)
-    graph.add_node("act", act)
+    graph.add_node("select_executor", select_executor)
+    graph.add_node("run_tool", run_tool_action)
+    graph.add_node("run_skill", run_skill_action)
+    graph.add_node("normalize_result", normalize_result)
     graph.add_node("observe", observe)
     graph.add_node("verify", verify)
     graph.add_node("final_answer", final_answer)
@@ -622,8 +662,12 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
     graph.add_edge("route_skill", "validate_skill")
     graph.add_conditional_edges("validate_skill", route_after_validation, {"prepare_action": "prepare_action", "fallback_route": "fallback_route"})
     graph.add_edge("fallback_route", "prepare_action")
-    graph.add_edge("prepare_action", "act")
-    graph.add_edge("act", "observe")
+    graph.add_edge("prepare_action", "select_executor")
+    graph.add_conditional_edges("select_executor", route_executor, {"run_tool": "run_tool", "run_skill": "run_skill"})
+    graph.add_edge("run_tool", "normalize_result")
+    graph.add_edge("run_skill", "normalize_result")
+    graph.add_edge("normalize_result", "observe")
+
     graph.add_edge("observe", "verify")
     graph.add_conditional_edges("verify", should_continue_plan, {"continue": "route_skill", "final": "final_answer"})
     graph.add_edge("final_answer", END)
@@ -698,6 +742,8 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
     graph.add_edge("retry", END)
 
     return graph.compile()
+
+
 
 
 
