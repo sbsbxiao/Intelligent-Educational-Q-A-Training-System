@@ -416,7 +416,7 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
 
         question = state.get("question", "")
         next_state = dict(state)
-        next_state.setdefault("history_text", education_agent.load_history(session_id=state.get("session_id", "default")))
+        next_state.setdefault("history_text", "")
         next_state.setdefault("plan_type", _detect_plan_type(question))
         next_state.setdefault("thoughts", [])
         next_state.setdefault("actions", [])
@@ -431,6 +431,13 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
         next_state.setdefault("is_satisfied", False)
         next_state.setdefault("result", None)
         return next_state
+
+    async def load_history(state: dict) -> dict:
+        if not education_agent:
+            raise RuntimeError("Plan ReAct workflow requires education_agent")
+
+        session_id = state.get("session_id", DEFAULT_SESSION_ID)
+        return {"history_text": education_agent.load_history(session_id=session_id)}
 
     async def route_skill(state: dict) -> dict:
         if not education_agent:
@@ -618,7 +625,7 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
             return "final"
         return "continue"
 
-    async def final_answer(state: dict) -> dict:
+    async def generate_final_answer(state: dict) -> dict:
         if not education_agent:
             raise RuntimeError("Plan ReAct workflow requires education_agent")
 
@@ -630,21 +637,47 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
         skill_name = state.get("skill_name") or "study_plan"
         history_text = state.get("history_text", "")
         answer = await education_agent.generate_final_answer(question, skill_name, skill_result, history_text)
+        return {"answer": answer, "skill_result": skill_result}
+
+    async def build_final_result(state: dict) -> dict:
+        if not education_agent:
+            raise RuntimeError("Plan ReAct workflow requires education_agent")
+
+        skill_result = state.get("skill_result")
+        if not isinstance(skill_result, SkillResult):
+            skill_result = SkillResult(success=False, data={}, tools_used=state.get("tools_used", []), sources=state.get("sources", []))
+
+        question = state.get("question", "")
+        skill_name = state.get("skill_name") or "study_plan"
+        answer = state.get("answer", "")
         result = education_agent.build_result(question, skill_name, skill_result, answer)
-        session_id = state.get("session_id", "default")
+        return {"result": result, "skill_result": skill_result}
+
+    async def save_conversation_result(state: dict) -> dict:
+        if not education_agent:
+            raise RuntimeError("Plan ReAct workflow requires education_agent")
+
+        skill_result = state.get("skill_result")
+        if not isinstance(skill_result, SkillResult):
+            skill_result = SkillResult(success=False, data={}, tools_used=state.get("tools_used", []), sources=state.get("sources", []))
+
+        question = state.get("question", "")
+        answer = state.get("answer", "")
+        skill_name = state.get("skill_name") or "study_plan"
+        session_id = state.get("session_id", DEFAULT_SESSION_ID)
         education_agent.save_memory(question, answer, skill_name, session_id=session_id)
         education_agent.save_record(question, answer, skill_name, skill_result, session_id=session_id)
+        return {"skill_result": skill_result}
 
+    async def refresh_conversation_memory(state: dict) -> dict:
+        session_id = state.get("session_id", DEFAULT_SESSION_ID)
         await conversation_memory.refresh_short_memory(session_id=session_id)
         await conversation_memory.refresh_long_memory(session_id=session_id)
-
-        next_state = dict(state)
-        next_state["answer"] = answer
-        next_state["result"] = result
-        return next_state
+        return {}
 
     graph = StateGraph(dict)
     graph.add_node("initialize", initialize)
+    graph.add_node("load_history", load_history)
     graph.add_node("route_skill", route_skill)
     graph.add_node("validate_skill", validate_skill)
     graph.add_node("fallback_route", fallback_route)
@@ -655,10 +688,14 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
     graph.add_node("normalize_result", normalize_result)
     graph.add_node("observe", observe)
     graph.add_node("verify", verify)
-    graph.add_node("final_answer", final_answer)
+    graph.add_node("generate_final_answer", generate_final_answer)
+    graph.add_node("build_final_result", build_final_result)
+    graph.add_node("save_conversation_result", save_conversation_result)
+    graph.add_node("refresh_conversation_memory", refresh_conversation_memory)
 
     graph.set_entry_point("initialize")
-    graph.add_edge("initialize", "route_skill")
+    graph.add_edge("initialize", "load_history")
+    graph.add_edge("load_history", "route_skill")
     graph.add_edge("route_skill", "validate_skill")
     graph.add_conditional_edges("validate_skill", route_after_validation, {"prepare_action": "prepare_action", "fallback_route": "fallback_route"})
     graph.add_edge("fallback_route", "prepare_action")
@@ -669,8 +706,11 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
     graph.add_edge("normalize_result", "observe")
 
     graph.add_edge("observe", "verify")
-    graph.add_conditional_edges("verify", should_continue_plan, {"continue": "route_skill", "final": "final_answer"})
-    graph.add_edge("final_answer", END)
+    graph.add_conditional_edges("verify", should_continue_plan, {"continue": "route_skill", "final": "generate_final_answer"})
+    graph.add_edge("generate_final_answer", "build_final_result")
+    graph.add_edge("build_final_result", "save_conversation_result")
+    graph.add_edge("save_conversation_result", "refresh_conversation_memory")
+    graph.add_edge("refresh_conversation_memory", END)
 
     return graph.compile()
 
@@ -742,6 +782,9 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
     graph.add_edge("retry", END)
 
     return graph.compile()
+
+
+
 
 
 
