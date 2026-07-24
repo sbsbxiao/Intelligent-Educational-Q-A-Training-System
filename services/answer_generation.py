@@ -1,7 +1,11 @@
 ﻿from __future__ import annotations
 
+from collections.abc import Callable
+
+from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 
 from config import settings
@@ -21,46 +25,75 @@ DIRECT_ANSWER_PROMPT = """你是一个有帮助的智能助手。请直接回答
 
 
 class AnswerGenerationChain:
-    def __init__(self, llm: ChatOpenAI | None = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI | None = None,
+        history_factory: Callable[[str], BaseChatMessageHistory] | None = None,
+    ) -> None:
         self.llm = llm or ChatOpenAI(
             model=settings.openai_model,
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
             temperature=0,
         )
+        self.history_factory = history_factory
 
         self.answer_prompt = ChatPromptTemplate.from_messages([
             ("system", ANSWER_PROMPT),
+            ("system", "记忆增强信息:\n{memory_context}"),
+            MessagesPlaceholder("history"),
             (
                 "human",
-                "历史对话:\n{history_text}\n\n上下文信息:\n{context_text}\n\n用户问题: {question}",
+                "上下文信息:\n{context_text}\n\n用户问题: {question}",
             ),
         ])
         self.direct_answer_prompt = ChatPromptTemplate.from_messages([
             ("system", DIRECT_ANSWER_PROMPT),
+            ("system", "记忆增强信息:\n{memory_context}"),
+            MessagesPlaceholder("history"),
             (
                 "human",
-                "历史对话:\n{history_text}\n\n当前问题: {question}",
+                "当前问题: {question}",
             ),
         ])
 
         parser = StrOutputParser()
-        self.answer_chain = self.answer_prompt | self.llm | parser
-        self.direct_answer_chain = self.direct_answer_prompt | self.llm | parser
+        answer_core = self.answer_prompt | self.llm | parser
+        direct_answer_core = self.direct_answer_prompt | self.llm | parser
+
+        if history_factory:
+            self.answer_chain = RunnableWithMessageHistory(
+                answer_core,
+                history_factory,
+                input_messages_key="question",
+                history_messages_key="history",
+            )
+            self.direct_answer_chain = RunnableWithMessageHistory(
+                direct_answer_core,
+                history_factory,
+                input_messages_key="question",
+                history_messages_key="history",
+            )
+        else:
+            self.answer_chain = answer_core
+            self.direct_answer_chain = direct_answer_core
 
     async def generate(
         self,
         *,
+        session_id: str,
         question: str,
-        history_text: str = "",
+        memory_context: str = "",
         context_text: str = "",
         has_context: bool = True,
     ) -> str:
         payload = {
             "question": question,
-            "history_text": history_text or "无",
+            "memory_context": memory_context or "无",
             "context_text": context_text,
+            "history": [],
         }
+        config = {"configurable": {"session_id": session_id}}
         if has_context:
-            return await self.answer_chain.ainvoke(payload)
-        return await self.direct_answer_chain.ainvoke(payload)
+            return await self.answer_chain.ainvoke(payload, config=config)
+        return await self.direct_answer_chain.ainvoke(payload, config=config)

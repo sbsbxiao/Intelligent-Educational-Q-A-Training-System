@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Any
 
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import tool
 
 from config import settings
@@ -100,6 +102,27 @@ class ConversationMemoryStore:
             parts.append(f"最近历史对话:\n{history_text}")
         return "\n\n".join(parts)
 
+    def build_history_context(self, session_id: str = DEFAULT_SESSION_ID) -> dict[str, str]:
+        return {
+            "recent_history": self.format_history(session_id=session_id, max_messages=4),
+            "short_memory": self.format_short_memory_summary(session_id=session_id),
+            "long_memory": self.format_long_memory_summary(session_id=session_id),
+        }
+
+    def format_memory_context(self, session_id: str = DEFAULT_SESSION_ID) -> str:
+        context = self.build_history_context(session_id=session_id)
+        parts: list[str] = []
+        if context["long_memory"]:
+            parts.append(f"长时记忆摘要:\n{context['long_memory']}")
+        if context["short_memory"]:
+            parts.append(f"短时记忆摘要:\n{context['short_memory']}")
+        if context["recent_history"]:
+            parts.append(f"最近历史摘要:\n{context['recent_history']}")
+        return "\n\n".join(parts)
+
+    def get_message_history(self, session_id: str = DEFAULT_SESSION_ID) -> "JsonFileChatMessageHistory":
+        return JsonFileChatMessageHistory(store=self, session_id=session_id)
+
     def load_records(self, session_id: str = DEFAULT_SESSION_ID) -> list[dict[str, Any]]:
         data = self._read_all(self.records_file_path)
         records = data.get(session_id, [])
@@ -156,6 +179,7 @@ class ConversationMemoryStore:
         memories = self.load_long_memories(session_id=session_id)[-settings.max_long_memory_items:]
         parts = [str(item.get("memory", "")).strip() for item in memories if str(item.get("memory", "")).strip()]
         return self._limit_text("；".join(parts), max_chars)
+
     def format_short_memory(self, session_id: str = DEFAULT_SESSION_ID) -> str:
         memories = self.load_short_memories(session_id=session_id)
         lines: list[str] = []
@@ -377,6 +401,7 @@ class ConversationMemoryStore:
         if max_chars <= 0 or len(cleaned) <= max_chars:
             return cleaned
         return cleaned[:max_chars].rstrip() + "..."
+
     @staticmethod
     def _fifo(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
         if limit <= 0:
@@ -410,13 +435,62 @@ class ConversationMemoryStore:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+class JsonFileChatMessageHistory(BaseChatMessageHistory):
+    def __init__(self, store: ConversationMemoryStore, session_id: str = DEFAULT_SESSION_ID) -> None:
+        self.store = store
+        self.session_id = session_id
+
+    @property
+    def messages(self) -> list[BaseMessage]:
+        raw_messages = self.store.load_messages(session_id=self.session_id)
+        messages: list[BaseMessage] = []
+        for item in raw_messages:
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+        return messages
+
+    def add_messages(self, messages: list[BaseMessage]) -> None:
+        if not messages:
+            return
+        with self.store._lock:
+            data = self.store._read_all(self.store.file_path)
+            raw_messages = data.get(self.session_id, [])
+            if not isinstance(raw_messages, list):
+                raw_messages = []
+            now = int(time.time())
+            for message in messages:
+                role = "assistant"
+                if isinstance(message, HumanMessage):
+                    role = "user"
+                raw_messages.append({
+                    "role": role,
+                    "content": str(message.content),
+                    "created_at": now,
+                    "metadata": {},
+                })
+            data[self.session_id] = raw_messages[-settings.max_history_messages:]
+            self.store._write_all(self.store.file_path, data)
+
+    def clear(self) -> None:
+        with self.store._lock:
+            data = self.store._read_all(self.store.file_path)
+            data[self.session_id] = []
+            self.store._write_all(self.store.file_path, data)
+
+
 conversation_memory = ConversationMemoryStore()
 
 
 @tool
 def load_conversation_history(session_id: str = DEFAULT_SESSION_ID) -> str:
     """Load recent conversation history for the current session."""
-    return conversation_memory.format_history_with_short_memory(session_id=session_id)
+    return conversation_memory.format_memory_context(session_id=session_id)
 
 
 @tool
@@ -424,5 +498,3 @@ def save_conversation_turn(question: str, answer: str, session_id: str = DEFAULT
     """Save one user question and assistant answer into local conversation history."""
     conversation_memory.append_turn(question=question, answer=answer, session_id=session_id)
     return "saved"
-
-

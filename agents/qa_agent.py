@@ -63,7 +63,10 @@ class QAAgent:
         self.knowledge_graph = knowledge_graph
         self.local_llm = create_local_text_generation_model()
         self.query_understanding = QueryUnderstandingChains(llm=self.llm)
-        self.answer_generation = AnswerGenerationChain(llm=self.llm)
+        self.answer_generation = AnswerGenerationChain(
+            llm=self.llm,
+            history_factory=conversation_memory.get_message_history,
+        )
         self.vector_retriever = (
             VectorKnowledgeRetriever(vector_store=self.vector_store, top_k=5)
             if self.vector_store
@@ -88,7 +91,7 @@ class QAAgent:
         )
 
     async def answer(self, question: str, session_id: str = DEFAULT_SESSION_ID) -> QAResult:
-        history_text = conversation_memory.format_history_with_short_memory(session_id=session_id)
+        memory_context = conversation_memory.format_memory_context(session_id=session_id)
 
         try:
             intent = await self._classify_intent(question)
@@ -102,7 +105,13 @@ class QAAgent:
 
         top_contexts = await self._retrieve_contexts(question, rewritten)
 
-        answer_text, reasoning = await self._generate_answer(question, top_contexts, intent, history_text)
+        answer_text, reasoning = await self._generate_answer(
+            question,
+            top_contexts,
+            intent,
+            session_id=session_id,
+            memory_context=memory_context,
+        )
         conversation_memory.append_turn(
             question=question,
             answer=answer_text,
@@ -193,12 +202,15 @@ class QAAgent:
         question: str,
         contexts: list[RetrievedContext],
         intent: QueryIntent,
-        history_text: str = "",
+        *,
+        session_id: str,
+        memory_context: str = "",
     ) -> tuple[str, list[str]]:
         if not contexts:
             answer = await self.answer_generation.generate(
+                session_id=session_id,
                 question=question,
-                history_text=history_text,
+                memory_context=memory_context,
                 context_text="",
                 has_context=False,
             )
@@ -220,8 +232,9 @@ class QAAgent:
         ]
 
         answer = await self.answer_generation.generate(
+            session_id=session_id,
             question=question,
-            history_text=history_text,
+            memory_context=memory_context,
             context_text=context_text,
             has_context=True,
         )
