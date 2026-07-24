@@ -110,7 +110,22 @@ class EducationAgent:
         return conversation_memory.format_history_with_short_memory(session_id=session_id)
 
     async def route_question(self, question: str, history_text: str = "") -> str:
-        return await self._route_with_llm(question, history_text)
+        routed = await self.select_skill_with_llm(question, history_text)
+        if self.is_valid_skill(routed):
+            return routed
+        return self.route_by_rules(question)
+
+    async def select_skill_with_llm(self, question: str, history_text: str = "") -> str:
+        try:
+            return await self._llm_select_skill(question, history_text)
+        except Exception:
+            return ""
+
+    def is_valid_skill(self, skill_name: str) -> bool:
+        return skill_name in self._VALID_SKILLS
+
+    def route_by_rules(self, question: str) -> str:
+        return self._route_by_rules(question)
 
     async def run_skill(self, skill_name: str, question: str, **kwargs: Any) -> SkillResult:
         try:
@@ -174,7 +189,6 @@ class EducationAgent:
             metadata={"agent": "education", "skill": skill_name},
         )
 
-
     def save_record(
         self,
         question: str,
@@ -196,6 +210,7 @@ class EducationAgent:
                 "error": skill_result.error,
             },
         )
+
     def build_result(
         self,
         question: str,
@@ -243,15 +258,6 @@ class EducationAgent:
             cleaned_list = [EducationAgent._remove_empty_values(item) for item in value]
             return [item for item in cleaned_list if item not in (None, "", [], {})]
         return value
-
-    async def _route_with_llm(self, question: str, history_text: str = "") -> str:
-        try:
-            routed = await self._llm_select_skill(question, history_text)
-            if routed in self._VALID_SKILLS:
-                return routed
-        except Exception:
-            pass
-        return self._route_by_rules(question)
 
     async def _llm_select_skill(self, question: str, history_text: str = "") -> str:
         llm_with_tools = self.llm.bind_tools(self._ROUTING_TOOLS, tool_choice="auto")
@@ -332,9 +338,3 @@ class EducationAgent:
             data=skill_result.data if isinstance(skill_result.data, dict) else {"result": skill_result.data},
             metadata=metadata,
         )
-
-
-
-
-
-

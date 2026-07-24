@@ -432,15 +432,60 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
         next_state.setdefault("result", None)
         return next_state
 
-    async def think(state: dict) -> dict:
+    async def route_skill(state: dict) -> dict:
         if not education_agent:
             raise RuntimeError("Plan ReAct workflow requires education_agent")
 
         question = state.get("question", "")
         history_text = state.get("history_text", "")
-        skill_name = await education_agent.route_question(question, history_text)
+        candidate_skill = await education_agent.select_skill_with_llm(question, history_text)
+
+        next_state = dict(state)
+        next_state["candidate_skill"] = candidate_skill
+        next_state["thoughts"] = [
+            *state.get("thoughts", []),
+            f"Route candidate from LLM: {candidate_skill or 'none'}",
+        ]
+        return next_state
+
+    async def validate_skill(state: dict) -> dict:
+        candidate_skill = state.get("candidate_skill", "")
+        is_valid = education_agent.is_valid_skill(candidate_skill) if education_agent else False
+
+        next_state = dict(state)
+        next_state["route_is_valid"] = is_valid
+        if is_valid:
+            next_state["skill_name"] = candidate_skill
+            next_state["thoughts"] = [
+                *state.get("thoughts", []),
+                f"Validated skill route: {candidate_skill}",
+            ]
+        return next_state
+
+    def route_after_validation(state: dict) -> str:
+        if bool(state.get("route_is_valid", False)):
+            return "prepare_action"
+        return "fallback_route"
+
+    async def fallback_route(state: dict) -> dict:
+        if not education_agent:
+            raise RuntimeError("Plan ReAct workflow requires education_agent")
+
+        question = state.get("question", "")
+        skill_name = education_agent.route_by_rules(question)
+
+        next_state = dict(state)
+        next_state["skill_name"] = skill_name
+        next_state["thoughts"] = [
+            *state.get("thoughts", []),
+            f"Fallback rule route: {skill_name}",
+        ]
+        return next_state
+
+    async def prepare_action(state: dict) -> dict:
+        question = state.get("question", "")
+        skill_name = state.get("skill_name", "study_plan")
         iteration = int(state.get("iteration", 0)) + 1
-        thought = f"Iteration {iteration}: select {skill_name} for plan design context retrieval."
         action = {
             "type": "skill",
             "name": skill_name,
@@ -449,9 +494,11 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
 
         next_state = dict(state)
         next_state["iteration"] = iteration
-        next_state["skill_name"] = skill_name
-        next_state["thoughts"] = [*state.get("thoughts", []), thought]
         next_state["actions"] = [*state.get("actions", []), action]
+        next_state["thoughts"] = [
+            *state.get("thoughts", []),
+            f"Iteration {iteration}: select {skill_name} for plan design context retrieval.",
+        ]
         return next_state
 
     async def act(state: dict) -> dict:
@@ -561,18 +608,24 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
 
     graph = StateGraph(dict)
     graph.add_node("initialize", initialize)
-    graph.add_node("think", think)
+    graph.add_node("route_skill", route_skill)
+    graph.add_node("validate_skill", validate_skill)
+    graph.add_node("fallback_route", fallback_route)
+    graph.add_node("prepare_action", prepare_action)
     graph.add_node("act", act)
     graph.add_node("observe", observe)
     graph.add_node("verify", verify)
     graph.add_node("final_answer", final_answer)
 
     graph.set_entry_point("initialize")
-    graph.add_edge("initialize", "think")
-    graph.add_edge("think", "act")
+    graph.add_edge("initialize", "route_skill")
+    graph.add_edge("route_skill", "validate_skill")
+    graph.add_conditional_edges("validate_skill", route_after_validation, {"prepare_action": "prepare_action", "fallback_route": "fallback_route"})
+    graph.add_edge("fallback_route", "prepare_action")
+    graph.add_edge("prepare_action", "act")
     graph.add_edge("act", "observe")
     graph.add_edge("observe", "verify")
-    graph.add_conditional_edges("verify", should_continue_plan, {"continue": "think", "final": "final_answer"})
+    graph.add_conditional_edges("verify", should_continue_plan, {"continue": "route_skill", "final": "final_answer"})
     graph.add_edge("final_answer", END)
 
     return graph.compile()
@@ -645,4 +698,6 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
     graph.add_edge("retry", END)
 
     return graph.compile()
+
+
 
