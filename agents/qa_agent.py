@@ -8,10 +8,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from config import settings
+from services.answer_generation import AnswerGenerationChain
 from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from services.local_text_generation import create_local_text_generation_model
 from services.query_understanding import QueryUnderstandingChains
@@ -45,18 +45,6 @@ class QAResult:
     reasoning_steps: list[str] = field(default_factory=list)
 
 
-ANSWER_PROMPT = """\
-你是一个专业的企业知识问答助手。根据检索到的上下文信息回答用户问题。
-
-要求：
-1. 答案必须基于提供的上下文，不要编造
-2. 如果上下文信息不足，明确告知用户
-3. 引用信息来源（如 [来源: xxx]）
-4. 如果涉及多个信息源，综合分析后给出结论
-5. 保持专业、准确、简洁
-"""
-
-
 class QAAgent:
     """QA agent entrypoint."""
 
@@ -75,6 +63,7 @@ class QAAgent:
         self.knowledge_graph = knowledge_graph
         self.local_llm = create_local_text_generation_model()
         self.query_understanding = QueryUnderstandingChains(llm=self.llm)
+        self.answer_generation = AnswerGenerationChain(llm=self.llm)
         self.vector_retriever = (
             VectorKnowledgeRetriever(vector_store=self.vector_store, top_k=5)
             if self.vector_store
@@ -207,17 +196,13 @@ class QAAgent:
         history_text: str = "",
     ) -> tuple[str, list[str]]:
         if not contexts:
-            messages = [
-                SystemMessage(
-                    content=(
-                        "你是一个有帮助的智能助手。请直接回答用户问题。"
-                        "如果问题需要项目知识但当前没有可用知识库，请简要说明。"
-                    )
-                ),
-                HumanMessage(content=f"历史对话:\n{history_text or '无'}\n\n当前问题: {question}"),
-            ]
-            resp = await self.llm.ainvoke(messages)
-            return resp.content, [
+            answer = await self.answer_generation.generate(
+                question=question,
+                history_text=history_text,
+                context_text="",
+                has_context=False,
+            )
+            return answer, [
                 f"识别问题意图: {intent.value}",
                 "未获得检索上下文，使用大模型直接回答",
                 "答案生成完成",
@@ -234,13 +219,14 @@ class QAAgent:
             f"图谱检索: {sum(1 for c in contexts if c.retrieval_type == 'graph')} 条",
         ]
 
-        messages = [
-            SystemMessage(content=ANSWER_PROMPT),
-            HumanMessage(content=f"历史对话:\n{history_text or '无'}\n\n上下文信息:\n{context_text}\n\n用户问题: {question}"),
-        ]
-        resp = await self.llm.ainvoke(messages)
+        answer = await self.answer_generation.generate(
+            question=question,
+            history_text=history_text,
+            context_text=context_text,
+            has_context=True,
+        )
         reasoning_steps.append("答案生成完成")
-        return resp.content, reasoning_steps
+        return answer, reasoning_steps
 
     @staticmethod
     def _calc_confidence(contexts: list[RetrievedContext]) -> float:
