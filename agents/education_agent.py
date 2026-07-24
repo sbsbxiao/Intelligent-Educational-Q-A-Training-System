@@ -4,7 +4,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 from config import settings
@@ -24,6 +25,13 @@ from tools.question_tools import QuestionBankSearchTool
 from tools.registry import register_tool
 
 
+ANSWER_WITH_CONTEXT_PROMPT = """你是教育培训机构知识助手。请结合可用上下文回答用户问题。
+如果上下文不足，可以基于通用教育知识补充，但要避免编造具体机构资料。"""
+
+DIRECT_ANSWER_PROMPT = """你是教育培训机构知识助手。当前没有可用 RAG 上下文、工具结果或知识库资料。
+请直接基于大模型能力回答用户问题；如果问题需要机构内部资料，请明确说明当前缺少资料。"""
+
+
 @dataclass
 class EducationAgentResult:
     question: str
@@ -33,6 +41,53 @@ class EducationAgentResult:
     sources: list[dict[str, Any]] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class EducationAnswerGenerationChain:
+    def __init__(self, llm: ChatOpenAI) -> None:
+        parser = StrOutputParser()
+        self.answer_prompt = ChatPromptTemplate.from_messages([
+            ("system", ANSWER_WITH_CONTEXT_PROMPT),
+            (
+                "human",
+                "问题类型/Skill: {skill_name}\n"
+                "工具调用: {tools_used}\n"
+                "上下文信息:\n{context_text}\n\n"
+                "历史对话:\n{history_text}\n\n"
+                "用户问题: {question}",
+            ),
+        ])
+        self.direct_answer_prompt = ChatPromptTemplate.from_messages([
+            ("system", DIRECT_ANSWER_PROMPT),
+            (
+                "human",
+                "问题类型/Skill: {skill_name}\n"
+                "历史对话:\n{history_text}\n\n"
+                "用户问题: {question}",
+            ),
+        ])
+        self.answer_chain = self.answer_prompt | llm | parser
+        self.direct_answer_chain = self.direct_answer_prompt | llm | parser
+
+    async def generate(
+        self,
+        *,
+        question: str,
+        skill_name: str,
+        history_text: str,
+        context_text: str,
+        tools_used: list[str],
+    ) -> str:
+        payload = {
+            "question": question,
+            "skill_name": skill_name,
+            "history_text": history_text or "无",
+            "context_text": context_text,
+            "tools_used": ", ".join(tools_used) if tools_used else "无",
+        }
+        if context_text:
+            return await self.answer_chain.ainvoke(payload)
+        return await self.direct_answer_chain.ainvoke(payload)
 
 
 class EducationAgent:
@@ -91,6 +146,7 @@ class EducationAgent:
             base_url=settings.openai_base_url,
             temperature=0,
         )
+        self.answer_generation = EducationAnswerGenerationChain(llm=self.llm)
         self._register_tools()
         self._register_skills()
 
@@ -150,30 +206,13 @@ class EducationAgent:
         history_text: str = "",
     ) -> str:
         context_text = self._format_context(skill_result)
-        if context_text:
-            system_prompt = (
-                "你是教育培训机构知识助手。请结合可用上下文回答用户问题。"
-                "如果上下文不足，可以基于通用教育知识补充，但要避免编造具体机构资料。"
-            )
-            user_prompt = (
-                f"问题类型/Skill: {skill_name}\n"
-                f"工具调用: {', '.join(skill_result.tools_used) if skill_result.tools_used else '无'}\n"
-                f"上下文信息:\n{context_text}\n\n"
-                f"历史对话:\n{history_text or '无'}\n\n"
-                f"用户问题: {question}"
-            )
-        else:
-            system_prompt = (
-                "你是教育培训机构知识助手。当前没有可用 RAG 上下文、工具结果或知识库资料。"
-                "请直接基于大模型能力回答用户问题；如果问题需要机构内部资料，请明确说明当前缺少资料。"
-            )
-            user_prompt = f"问题类型/Skill: {skill_name}\n历史对话:\n{history_text or '无'}\n\n用户问题: {question}"
-
-        response = await self.llm.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ])
-        return str(response.content)
+        return await self.answer_generation.generate(
+            question=question,
+            skill_name=skill_name,
+            history_text=history_text,
+            context_text=context_text,
+            tools_used=skill_result.tools_used,
+        )
 
     def save_memory(
         self,
@@ -338,3 +377,4 @@ class EducationAgent:
             data=skill_result.data if isinstance(skill_result.data, dict) else {"result": skill_result.data},
             metadata=metadata,
         )
+
