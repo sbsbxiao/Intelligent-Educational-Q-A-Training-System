@@ -360,21 +360,50 @@ def _build_qa_graph(qa_agent: QAAgent) -> StateGraph:
 def _build_education_graph(education_agent: EducationAgent | None) -> StateGraph:
     plan_react_graph = _build_plan_react_graph(education_agent) if education_agent else None
 
-    async def process_education_question(state: dict) -> dict:
+    async def initialize_education_request(state: dict) -> dict:
         if not education_agent:
             raise RuntimeError("Education workflow requires vector_store")
 
         question = state.get("question", "")
-        if _is_plan_design_question(question) and plan_react_graph:
-            return await plan_react_graph.ainvoke(state)
+        next_state = dict(state)
+        next_state["question"] = question
+        next_state["is_plan_design"] = _is_plan_design_question(question)
+        return next_state
 
+    def route_education_request(state: dict) -> str:
+        if bool(state.get("is_plan_design", False)) and plan_react_graph:
+            return "plan_design"
+        return "standard_answer"
+
+    async def process_standard_education_question(state: dict) -> dict:
+        if not education_agent:
+            raise RuntimeError("Education workflow requires vector_store")
+
+        question = state.get("question", "")
         result = await education_agent.answer(question)
         return {"result": result}
 
+    async def process_plan_design_question(state: dict) -> dict:
+        if not plan_react_graph:
+            raise RuntimeError("Plan ReAct workflow not initialized")
+        return await plan_react_graph.ainvoke(state)
+
     graph = StateGraph(dict)
-    graph.add_node("education_answer", process_education_question)
-    graph.set_entry_point("education_answer")
-    graph.add_edge("education_answer", END)
+    graph.add_node("initialize_request", initialize_education_request)
+    graph.add_node("standard_answer", process_standard_education_question)
+    graph.add_node("plan_design_answer", process_plan_design_question)
+
+    graph.set_entry_point("initialize_request")
+    graph.add_conditional_edges(
+        "initialize_request",
+        route_education_request,
+        {
+            "standard_answer": "standard_answer",
+            "plan_design": "plan_design_answer",
+        },
+    )
+    graph.add_edge("standard_answer", END)
+    graph.add_edge("plan_design_answer", END)
 
     return graph.compile()
 
@@ -616,3 +645,4 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
     graph.add_edge("retry", END)
 
     return graph.compile()
+
