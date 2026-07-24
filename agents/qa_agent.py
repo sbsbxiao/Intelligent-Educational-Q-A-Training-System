@@ -15,7 +15,7 @@ from services.answer_generation import AnswerGenerationChain
 from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from services.local_text_generation import create_local_text_generation_model
 from services.query_understanding import QueryUnderstandingChains
-from services.retrievers import GraphKnowledgeRetriever, HybridKnowledgeRetriever, VectorKnowledgeRetriever
+from services.retrievers import GraphKnowledgeRetriever, VectorKnowledgeRetriever
 
 
 class QueryIntent(str, Enum):
@@ -46,7 +46,7 @@ class QAResult:
 
 
 class QAAgent:
-    """QA agent entrypoint."""
+    """QA agent entrypoint and capability provider for graph nodes."""
 
     def __init__(
         self,
@@ -81,46 +81,150 @@ class QAAgent:
             if self.knowledge_graph
             else None
         )
-        self.hybrid_retriever = (
-            HybridKnowledgeRetriever(
-                vector_retriever=self.vector_retriever,
-                graph_retriever=self.graph_retriever,
-            )
-            if self.vector_retriever
-            else None
-        )
 
     async def answer(self, question: str, session_id: str = DEFAULT_SESSION_ID) -> QAResult:
-        memory_context = conversation_memory.format_memory_context(session_id=session_id)
+        memory_context = self.load_memory_context(session_id=session_id)
+        intent = await self.classify_intent(question)
+        rewritten = await self.rewrite_query(question)
+        vector_contexts = await self.retrieve_vector_contexts(question, rewritten)
+        graph_contexts = await self.retrieve_graph_contexts(question, rewritten)
+        top_contexts = self.fuse_contexts(vector_contexts, graph_contexts)
 
-        try:
-            intent = await self._classify_intent(question)
-        except Exception:
-            intent = QueryIntent.EXPLORATORY
-
-        try:
-            rewritten = await self._rewrite_query(question)
-        except Exception:
-            rewritten = {"queries": [question], "entities": [], "keywords": []}
-
-        top_contexts = await self._retrieve_contexts(question, rewritten)
-
-        answer_text, reasoning = await self._generate_answer(
+        answer_text, reasoning = await self.generate_answer(
             question,
             top_contexts,
             intent,
             session_id=session_id,
             memory_context=memory_context,
         )
-        conversation_memory.append_turn(
+        await self.save_answer_memory(
             question=question,
             answer=answer_text,
+            intent=intent,
+            contexts=top_contexts,
+            reasoning_steps=reasoning,
+            session_id=session_id,
+        )
+        return self.build_result(
+            question=question,
+            answer=answer_text,
+            contexts=top_contexts,
+            intent=intent,
+            reasoning_steps=reasoning,
+        )
+
+    def load_memory_context(self, session_id: str = DEFAULT_SESSION_ID) -> str:
+        return conversation_memory.format_memory_context(session_id=session_id)
+
+    async def classify_intent(self, question: str) -> QueryIntent:
+        try:
+            return await self._classify_intent(question)
+        except Exception:
+            return QueryIntent.EXPLORATORY
+
+    async def rewrite_query(self, question: str) -> dict[str, Any]:
+        try:
+            return await self._rewrite_query(question)
+        except Exception:
+            return {"queries": [question], "entities": [], "keywords": []}
+
+    async def retrieve_vector_contexts(self, question: str, rewritten: dict[str, Any]) -> list[RetrievedContext]:
+        if not self.vector_retriever:
+            return []
+
+        documents: list[Any] = []
+        queries = list(rewritten.get("queries", [])) or [question]
+        for query in queries:
+            try:
+                docs = await self.vector_retriever.ainvoke(query)
+            except Exception:
+                continue
+            if isinstance(docs, list):
+                documents.extend(docs)
+        return self._documents_to_contexts(documents)
+
+    async def retrieve_graph_contexts(self, question: str, rewritten: dict[str, Any]) -> list[RetrievedContext]:
+        if not self.graph_retriever:
+            return []
+
+        try:
+            documents = await self.graph_retriever.ainvoke(
+                {
+                    "question": question,
+                    "entities": rewritten.get("entities", []),
+                }
+            )
+        except Exception:
+            return []
+        return self._documents_to_contexts(documents if isinstance(documents, list) else [])
+
+    def fuse_contexts(
+        self,
+        vector_contexts: list[RetrievedContext],
+        graph_contexts: list[RetrievedContext],
+    ) -> list[RetrievedContext]:
+        merged = [*vector_contexts, *graph_contexts]
+        if not merged:
+            return []
+
+        weight_map = {"vector": 1.0, "graph": 1.2, "hybrid": 1.1}
+        unique: list[RetrievedContext] = []
+        seen: set[str] = set()
+
+        for context in merged:
+            key = context.content[:100]
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(
+                RetrievedContext(
+                    content=context.content,
+                    source=context.source,
+                    score=context.score * weight_map.get(context.retrieval_type, 1.0),
+                    retrieval_type=context.retrieval_type,
+                    metadata=dict(context.metadata),
+                )
+            )
+
+        unique.sort(key=lambda item: item.score, reverse=True)
+        return unique[:8]
+
+    async def generate_answer(
+        self,
+        question: str,
+        contexts: list[RetrievedContext],
+        intent: QueryIntent,
+        *,
+        session_id: str,
+        memory_context: str = "",
+    ) -> tuple[str, list[str]]:
+        return await self._generate_answer(
+            question,
+            contexts,
+            intent,
+            session_id=session_id,
+            memory_context=memory_context,
+        )
+
+    async def save_answer_memory(
+        self,
+        *,
+        question: str,
+        answer: str,
+        intent: QueryIntent,
+        contexts: list[RetrievedContext],
+        reasoning_steps: list[str],
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> None:
+        conversation_memory.append_turn(
+            question=question,
+            answer=answer,
             session_id=session_id,
             metadata={"agent": "qa", "intent": intent.value},
         )
         conversation_memory.append_record(
             question=question,
-            answer=answer_text,
+            answer=answer,
             agent="qa",
             session_id=session_id,
             metadata={
@@ -133,23 +237,32 @@ class QAAgent:
                         "score": context.score,
                         "type": context.retrieval_type,
                     }
-                    for context in top_contexts
+                    for context in contexts
                 ],
-                "confidence": self._calc_confidence(top_contexts),
-                "reasoning_steps": reasoning,
+                "confidence": self._calc_confidence(contexts),
+                "reasoning_steps": reasoning_steps,
             },
         )
 
         await conversation_memory.refresh_short_memory(session_id=session_id)
         await conversation_memory.refresh_long_memory(session_id=session_id)
 
+    def build_result(
+        self,
+        *,
+        question: str,
+        answer: str,
+        contexts: list[RetrievedContext],
+        intent: QueryIntent,
+        reasoning_steps: list[str],
+    ) -> QAResult:
         return QAResult(
             question=question,
-            answer=answer_text,
-            contexts=top_contexts,
+            answer=answer,
+            contexts=contexts,
             intent=intent,
-            confidence=self._calc_confidence(top_contexts),
-            reasoning_steps=reasoning,
+            confidence=self._calc_confidence(contexts),
+            reasoning_steps=reasoning_steps,
         )
 
     async def _classify_intent(self, question: str) -> QueryIntent:
@@ -169,33 +282,9 @@ class QAAgent:
         }
 
     async def _retrieve_contexts(self, question: str, rewritten: dict[str, Any]) -> list[RetrievedContext]:
-        if not self.hybrid_retriever:
-            return []
-
-        try:
-            documents = await self.hybrid_retriever.ainvoke(
-                {
-                    "question": question,
-                    "queries": rewritten.get("queries", []),
-                    "entities": rewritten.get("entities", []),
-                }
-            )
-        except Exception:
-            return []
-
-        contexts: list[RetrievedContext] = []
-        for document in documents[:8]:
-            metadata = dict(document.metadata)
-            contexts.append(
-                RetrievedContext(
-                    content=document.page_content,
-                    source=str(metadata.get("source", "")),
-                    score=float(metadata.get("score", 0.0)),
-                    retrieval_type=str(metadata.get("retrieval_type", "vector")),
-                    metadata=metadata,
-                )
-            )
-        return contexts
+        vector_contexts = await self.retrieve_vector_contexts(question, rewritten)
+        graph_contexts = await self.retrieve_graph_contexts(question, rewritten)
+        return self.fuse_contexts(vector_contexts, graph_contexts)
 
     async def _generate_answer(
         self,
@@ -247,3 +336,19 @@ class QAAgent:
             return 0.0
         avg_score = sum(c.score for c in contexts) / len(contexts)
         return min(avg_score, 1.0)
+
+    @staticmethod
+    def _documents_to_contexts(documents: list[Any]) -> list[RetrievedContext]:
+        contexts: list[RetrievedContext] = []
+        for document in documents:
+            metadata = dict(getattr(document, "metadata", {}))
+            contexts.append(
+                RetrievedContext(
+                    content=str(getattr(document, "page_content", "")),
+                    source=str(metadata.get("source", "")),
+                    score=float(metadata.get("score", 0.0)),
+                    retrieval_type=str(metadata.get("retrieval_type", "vector")),
+                    metadata=metadata,
+                )
+            )
+        return contexts

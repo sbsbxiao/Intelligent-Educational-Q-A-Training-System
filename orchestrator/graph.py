@@ -12,10 +12,10 @@ from agents.doc_parser_agent import DocParserAgent, DocumentChunk
 from agents.education_agent import EducationAgent, EducationAgentResult
 from agents.knowledge_extract_agent import ExtractionResult, KnowledgeExtractAgent
 from agents.knowledge_update_agent import DocumentChange, KnowledgeUpdateAgent, UpdateResult
-from agents.qa_agent import QAAgent, QAResult
+from agents.qa_agent import QAAgent, QAResult, QueryIntent
 from services.knowledge_graph import KnowledgeGraphService
 from services.vector_store import VectorStoreService
-from services.conversation_memory import conversation_memory
+from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from skills.base import SkillResult
 from tools.registry import get_tool
 
@@ -41,6 +41,16 @@ class IngestState(dict):
 
 class QAState(dict):
     question: str
+    session_id: str
+    memory_context: str
+    intent: QueryIntent | None
+    rewritten: dict[str, Any]
+    vector_contexts: list[Any]
+    graph_contexts: list[Any]
+    contexts: list[Any]
+    answer: str
+    reasoning_steps: list[str]
+    confidence: float
     result: QAResult | None
     messages: Annotated[list, add_messages]
 
@@ -226,15 +236,123 @@ def _build_ingest_graph(
 
 def _build_qa_graph(qa_agent: QAAgent) -> StateGraph:
 
-    async def process_question(state: dict) -> dict:
+    async def load_memory(state: dict) -> dict:
+        session_id = state.get("session_id", DEFAULT_SESSION_ID)
+        return {
+            "session_id": session_id,
+            "memory_context": qa_agent.load_memory_context(session_id=session_id),
+        }
+
+    async def classify_intent(state: dict) -> dict:
         question = state.get("question", "")
-        result = await qa_agent.answer(question)
+        intent = await qa_agent.classify_intent(question)
+        return {"intent": intent}
+
+    async def rewrite_query(state: dict) -> dict:
+        question = state.get("question", "")
+        rewritten = await qa_agent.rewrite_query(question)
+        return {"rewritten": rewritten}
+
+    async def retrieve_vector_contexts(state: dict) -> dict:
+        question = state.get("question", "")
+        rewritten = state.get("rewritten", {})
+        contexts = await qa_agent.retrieve_vector_contexts(question, rewritten)
+        return {"vector_contexts": contexts}
+
+    async def retrieve_graph_contexts(state: dict) -> dict:
+        question = state.get("question", "")
+        rewritten = state.get("rewritten", {})
+        contexts = await qa_agent.retrieve_graph_contexts(question, rewritten)
+        return {"graph_contexts": contexts}
+
+    async def fuse_contexts(state: dict) -> dict:
+        vector_contexts = state.get("vector_contexts", [])
+        graph_contexts = state.get("graph_contexts", [])
+        contexts = qa_agent.fuse_contexts(vector_contexts, graph_contexts)
+        return {"contexts": contexts}
+
+    async def generate_answer(state: dict) -> dict:
+        question = state.get("question", "")
+        session_id = state.get("session_id", DEFAULT_SESSION_ID)
+        memory_context = state.get("memory_context", "")
+        contexts = state.get("contexts", [])
+        intent = state.get("intent")
+        if not isinstance(intent, QueryIntent):
+            intent = QueryIntent.EXPLORATORY
+
+        answer_text, reasoning_steps = await qa_agent.generate_answer(
+            question,
+            contexts,
+            intent,
+            session_id=session_id,
+            memory_context=memory_context,
+        )
+        return {
+            "intent": intent,
+            "answer": answer_text,
+            "reasoning_steps": reasoning_steps,
+            "confidence": qa_agent.build_result(
+                question=question,
+                answer=answer_text,
+                contexts=contexts,
+                intent=intent,
+                reasoning_steps=reasoning_steps,
+            ).confidence,
+        }
+
+    async def save_memory(state: dict) -> dict:
+        question = state.get("question", "")
+        answer = state.get("answer", "")
+        intent = state.get("intent")
+        if not isinstance(intent, QueryIntent):
+            intent = QueryIntent.EXPLORATORY
+
+        await qa_agent.save_answer_memory(
+            question=question,
+            answer=answer,
+            intent=intent,
+            contexts=state.get("contexts", []),
+            reasoning_steps=state.get("reasoning_steps", []),
+            session_id=state.get("session_id", DEFAULT_SESSION_ID),
+        )
+        return {"intent": intent}
+
+    async def build_result(state: dict) -> dict:
+        intent = state.get("intent")
+        if not isinstance(intent, QueryIntent):
+            intent = QueryIntent.EXPLORATORY
+
+        result = qa_agent.build_result(
+            question=state.get("question", ""),
+            answer=state.get("answer", ""),
+            contexts=state.get("contexts", []),
+            intent=intent,
+            reasoning_steps=state.get("reasoning_steps", []),
+        )
         return {"result": result}
 
     graph = StateGraph(dict)
-    graph.add_node("answer", process_question)
-    graph.set_entry_point("answer")
-    graph.add_edge("answer", END)
+    graph.add_node("load_memory", load_memory)
+    graph.add_node("classify_intent", classify_intent)
+    graph.add_node("rewrite_query", rewrite_query)
+    graph.add_node("retrieve_vector_contexts", retrieve_vector_contexts)
+    graph.add_node("retrieve_graph_contexts", retrieve_graph_contexts)
+    graph.add_node("fuse_contexts", fuse_contexts)
+    graph.add_node("generate_answer", generate_answer)
+    graph.add_node("save_memory", save_memory)
+    graph.add_node("build_result", build_result)
+
+    graph.set_entry_point("load_memory")
+    graph.add_edge("load_memory", "classify_intent")
+    graph.add_edge("classify_intent", "rewrite_query")
+    graph.add_edge("rewrite_query", "retrieve_vector_contexts")
+    graph.add_edge("rewrite_query", "retrieve_graph_contexts")
+    graph.add_edge("retrieve_vector_contexts", "fuse_contexts")
+    graph.add_edge("retrieve_graph_contexts", "fuse_contexts")
+    graph.add_edge("fuse_contexts", "generate_answer")
+    graph.add_edge("generate_answer", "save_memory")
+    graph.add_edge("save_memory", "build_result")
+    graph.add_edge("build_result", END)
 
     return graph.compile()
 
@@ -467,6 +585,7 @@ def _merge_unique(existing: list[str], incoming: list[str]) -> list[str]:
             merged.append(item)
     return merged
 
+
 def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
 
     async def process_updates(state: dict) -> dict:
@@ -497,14 +616,3 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
     graph.add_edge("retry", END)
 
     return graph.compile()
-
-
-
-
-
-
-
-
-
-
-
