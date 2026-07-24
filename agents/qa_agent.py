@@ -1,12 +1,5 @@
 ﻿"""
-问答 Agent — 混合检索 (Vector + Graph) + 多跳推理 + 答案生成
-
-核心能力:
-  1. 意图识别 & 查询改写
-  2. 向量检索 (语义相似度)
-  3. 图谱检索 (Cypher 查询 / 子图遍历)
-  4. 混合排序 & 重排序
-  5. 基于检索结果的答案生成（带引用来源）
+QA agent with hybrid retrieval (vector + graph) and answer generation.
 """
 
 from __future__ import annotations
@@ -21,14 +14,15 @@ from langchain_openai import ChatOpenAI
 from config import settings
 from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from services.local_text_generation import create_local_text_generation_model
+from services.query_understanding import QueryUnderstandingChains
 
 
 class QueryIntent(str, Enum):
-    FACTOID = "factoid"           # 事实型问题
-    ANALYTICAL = "analytical"     # 分析型问题
-    COMPARATIVE = "comparative"   # 对比型问题
-    PROCEDURAL = "procedural"     # 流程型问题
-    EXPLORATORY = "exploratory"   # 探索型问题
+    FACTOID = "factoid"
+    ANALYTICAL = "analytical"
+    COMPARATIVE = "comparative"
+    PROCEDURAL = "procedural"
+    EXPLORATORY = "exploratory"
 
 
 @dataclass
@@ -36,7 +30,7 @@ class RetrievedContext:
     content: str
     source: str
     score: float
-    retrieval_type: str  # "vector" | "graph" | "hybrid"
+    retrieval_type: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -49,23 +43,6 @@ class QAResult:
     confidence: float
     reasoning_steps: list[str] = field(default_factory=list)
 
-
-INTENT_PROMPT = """\
-你是一个查询意图分类器。根据用户问题，返回意图类别（只返回类别名）：
-- factoid: 事实型（谁/什么/哪里/何时）
-- analytical: 分析型（为什么/怎么理解）
-- comparative: 对比型（A和B有什么区别）
-- procedural: 流程型（怎么做/步骤）
-- exploratory: 探索型（有哪些/概述）
-"""
-
-QUERY_REWRITE_PROMPT = """\
-你是一个查询改写专家。将用户问题改写为更适合检索的形式。
-要求：
-1. 提取核心实体和关键词
-2. 生成 1-3 个检索查询
-3. 返回 JSON: {"queries": ["查询1", "查询2"], "entities": ["实体1"], "keywords": ["关键词1"]}
-"""
 
 CYPHER_GENERATION_PROMPT = """\
 你是一个 Neo4j Cypher 查询生成专家。根据用户问题和提取的实体，生成 Cypher 查询。
@@ -92,12 +69,7 @@ ANSWER_PROMPT = """\
 
 
 class QAAgent:
-    """
-    问答 Agent
-
-    工作流:
-      query → intent_classify → rewrite → parallel_retrieve → rerank → generate_answer
-    """
+    """QA agent entrypoint."""
 
     def __init__(
         self,
@@ -113,11 +85,9 @@ class QAAgent:
         self.vector_store = vector_store
         self.knowledge_graph = knowledge_graph
         self.local_llm = create_local_text_generation_model()
-
-    # ── public API ───────────────────────────────────────────
+        self.query_understanding = QueryUnderstandingChains(llm=self.llm)
 
     async def answer(self, question: str, session_id: str = DEFAULT_SESSION_ID) -> QAResult:
-        """完整问答流程"""
         history_text = conversation_memory.format_history_with_short_memory(session_id=session_id)
 
         try:
@@ -177,38 +147,21 @@ class QAAgent:
             reasoning_steps=reasoning,
         )
 
-    # ── intent classification ────────────────────────────────
-
     async def _classify_intent(self, question: str) -> QueryIntent:
-        messages = [
-            SystemMessage(content=INTENT_PROMPT),
-            HumanMessage(content=question),
-        ]
-        resp = await self.llm.ainvoke(messages)
-        raw = resp.content.strip().lower()
-        for intent in QueryIntent:
-            if intent.value in raw:
-                return intent
-        return QueryIntent.FACTOID
-
-    # ── query rewriting ──────────────────────────────────────
+        intent_name = await self.query_understanding.classify_intent(question)
+        try:
+            return QueryIntent(intent_name)
+        except ValueError:
+            return QueryIntent.FACTOID
 
     async def _rewrite_query(self, question: str) -> dict:
-        import json
-        messages = [
-            SystemMessage(content=QUERY_REWRITE_PROMPT),
-            HumanMessage(content=question),
-        ]
-        resp = await self.llm.ainvoke(messages)
-        try:
-            cleaned = resp.content.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
-            return json.loads(cleaned)
-        except (json.JSONDecodeError, IndexError):
-            return {"queries": [question], "entities": [], "keywords": []}
-
-    # ── vector retrieval ─────────────────────────────────────
+        rewritten = await self.query_understanding.rewrite_query(question)
+        queries = rewritten.queries or [question]
+        return {
+            "queries": queries,
+            "entities": rewritten.entities,
+            "keywords": rewritten.keywords,
+        }
 
     async def _vector_retrieve(self, rewritten: dict) -> list[RetrievedContext]:
         if not self.vector_store:
@@ -230,13 +183,12 @@ class QAAgent:
                 ))
         return contexts
 
-    # ── graph retrieval ──────────────────────────────────────
-
     async def _graph_retrieve(self, question: str, rewritten: dict) -> list[RetrievedContext]:
         if not self.knowledge_graph:
             return []
 
         import json
+
         entities = rewritten.get("entities", [])
         try:
             raw = await self.local_llm.agenerate(
@@ -264,14 +216,8 @@ class QAAgent:
                 continue
         return contexts
 
-    # ── hybrid reranking ─────────────────────────────────────
-
     @staticmethod
     def _hybrid_rerank(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
-        """
-        混合重排序：向量分数 + 图谱分数加权
-        图谱检索结果天然带有结构化关系，给予略高权重
-        """
         weight_map = {"vector": 1.0, "graph": 1.2, "hybrid": 1.1}
         for ctx in contexts:
             ctx.score *= weight_map.get(ctx.retrieval_type, 1.0)
@@ -286,8 +232,6 @@ class QAAgent:
 
         unique.sort(key=lambda c: c.score, reverse=True)
         return unique
-
-    # ── answer generation ────────────────────────────────────
 
     async def _generate_answer(
         self,
@@ -338,6 +282,7 @@ class QAAgent:
             return 0.0
         avg_score = sum(c.score for c in contexts) / len(contexts)
         return min(avg_score, 1.0)
+
     @staticmethod
     def _clean_json_text(raw: str) -> str:
         cleaned = raw.strip()
@@ -348,6 +293,3 @@ class QAAgent:
         if start >= 0 and end >= start:
             cleaned = cleaned[start : end + 1]
         return cleaned.strip()
-
-
-
