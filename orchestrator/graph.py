@@ -266,9 +266,11 @@ def _build_qa_graph(qa_agent: QAAgent) -> StateGraph:
         return {"graph_contexts": contexts}
 
     async def fuse_contexts(state: dict) -> dict:
+        question = state.get("question", "")
+        rewritten = state.get("rewritten", {})
         vector_contexts = state.get("vector_contexts", [])
         graph_contexts = state.get("graph_contexts", [])
-        contexts = qa_agent.fuse_contexts(vector_contexts, graph_contexts)
+        contexts = await qa_agent.rerank_contexts(question, rewritten, vector_contexts, graph_contexts)
         return {"contexts": contexts}
 
     async def generate_answer(state: dict) -> dict:
@@ -636,7 +638,7 @@ def _build_plan_react_graph(education_agent: EducationAgent | None) -> StateGrap
         question = state.get("question", "")
         skill_name = state.get("skill_name") or "study_plan"
         history_text = state.get("history_text", "")
-        answer = await education_agent.generate_final_answer(question, skill_name, skill_result, history_text)
+        answer = await education_agent.generate_final_answer(question, skill_name, skill_result, history_text, plan_mode=True)
         return {"answer": answer, "skill_result": skill_result}
 
     async def build_final_result(state: dict) -> dict:
@@ -782,6 +784,8 @@ def _build_update_graph(update_agent: KnowledgeUpdateAgent) -> StateGraph:
     graph.add_edge("retry", END)
 
     return graph.compile()
+
+
 
 
 

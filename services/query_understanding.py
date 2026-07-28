@@ -21,9 +21,11 @@ INTENT_PROMPT = """你是一个查询意图分类器。根据用户问题识别�
 
 QUERY_REWRITE_PROMPT = """你是一个查询改写专家。将用户问题改写为更适合检索的形式。
 要求：
-1. 提取核心实体和关键词
-2. 生成 1-3 个检索查询
-3. 保持原问题语义，不要编造不存在的领域信息"""
+1. 提取核心实体和关键词，保留课程名、章节名、题型名、机构名等关键标识。
+2. 生成 1-3 个检索查询，覆盖原问法、关键词问法、补全后的短语问法。
+3. 检索查询必须更适合向量检索和知识图谱检索，但不能偏离原问题语义。
+4. 不要编造不存在的事实，不要引入原问题中没有的新领域。
+5. 如果原问题已经很适合检索，至少保留原问题本身作为一个查询。"""
 
 _VALID_INTENTS = {"factoid", "analytical", "comparative", "procedural", "exploratory"}
 
@@ -60,11 +62,26 @@ class QueryUnderstandingChains:
         return result.intent
 
     async def rewrite_query(self, question: str) -> QueryRewriteOutput:
-        return await self.rewrite_chain.ainvoke({
+        rewritten = await self.rewrite_chain.ainvoke({
             "system_prompt": QUERY_REWRITE_PROMPT,
             "format_instructions": self.rewrite_parser.format_instructions(),
             "question": question,
         })
+        queries = self._dedupe_keep_order([question, *rewritten.queries])
+        return QueryRewriteOutput(
+            queries=queries[:3],
+            entities=self._dedupe_keep_order(rewritten.entities),
+            keywords=self._dedupe_keep_order(rewritten.keywords),
+        )
+
+    async def build_retrieval_payload(self, question: str) -> dict[str, Any]:
+        rewritten = await self.rewrite_query(question)
+        return {
+            "question": question,
+            "queries": rewritten.queries or [question],
+            "entities": rewritten.entities,
+            "keywords": rewritten.keywords,
+        }
 
     def _parse_intent_message(self, message: BaseMessage) -> IntentClassificationOutput:
         parsed = self.intent_parser.parse_or_default(
@@ -82,9 +99,9 @@ class QueryUnderstandingChains:
             lambda: QueryRewriteOutput(queries=[], entities=[], keywords=[]),
         )
 
-        queries = [str(item).strip() for item in parsed.queries if str(item).strip()]
-        entities = [str(item).strip() for item in parsed.entities if str(item).strip()]
-        keywords = [str(item).strip() for item in parsed.keywords if str(item).strip()]
+        queries = self._dedupe_keep_order(str(item).strip() for item in parsed.queries if str(item).strip())
+        entities = self._dedupe_keep_order(str(item).strip() for item in parsed.entities if str(item).strip())
+        keywords = self._dedupe_keep_order(str(item).strip() for item in parsed.keywords if str(item).strip())
 
         return QueryRewriteOutput(
             queries=queries[:3],
@@ -100,3 +117,16 @@ class QueryUnderstandingChains:
         if isinstance(content, list):
             return "\n".join(str(item) for item in content)
         return str(content)
+
+    @staticmethod
+    def _dedupe_keep_order(items: Any) -> list[str]:
+        output: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            normalized = str(item).strip()
+            key = normalized.lower()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            output.append(normalized)
+        return output

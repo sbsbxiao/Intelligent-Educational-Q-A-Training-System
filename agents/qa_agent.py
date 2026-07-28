@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 
 from config import settings
@@ -15,7 +16,8 @@ from services.answer_generation import AnswerGenerationChain
 from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from services.local_text_generation import create_local_text_generation_model
 from services.query_understanding import QueryUnderstandingChains
-from services.retrievers import GraphKnowledgeRetriever, VectorKnowledgeRetriever
+from services.rerank import SharedRerankService
+from services.retrievers import GraphKnowledgeRetriever, HybridKnowledgeRetriever, VectorKnowledgeRetriever
 
 
 class QueryIntent(str, Enum):
@@ -63,12 +65,13 @@ class QAAgent:
         self.knowledge_graph = knowledge_graph
         self.local_llm = create_local_text_generation_model()
         self.query_understanding = QueryUnderstandingChains(llm=self.llm)
+        self.rerank_service = SharedRerankService()
         self.answer_generation = AnswerGenerationChain(
             llm=self.llm,
             history_factory=conversation_memory.get_message_history,
         )
         self.vector_retriever = (
-            VectorKnowledgeRetriever(vector_store=self.vector_store, top_k=5)
+            VectorKnowledgeRetriever(vector_store=self.vector_store, top_k=5, rerank_service=self.rerank_service)
             if self.vector_store
             else None
         )
@@ -77,8 +80,19 @@ class QAAgent:
                 knowledge_graph=self.knowledge_graph,
                 local_llm=self.local_llm,
                 top_k=5,
+                rerank_service=self.rerank_service,
             )
             if self.knowledge_graph
+            else None
+        )
+        self.hybrid_retriever = (
+            HybridKnowledgeRetriever(
+                vector_retriever=self.vector_retriever,
+                graph_retriever=self.graph_retriever,
+                top_k=8,
+                rerank_service=self.rerank_service,
+            )
+            if self.vector_retriever
             else None
         )
 
@@ -86,9 +100,7 @@ class QAAgent:
         memory_context = self.load_memory_context(session_id=session_id)
         intent = await self.classify_intent(question)
         rewritten = await self.rewrite_query(question)
-        vector_contexts = await self.retrieve_vector_contexts(question, rewritten)
-        graph_contexts = await self.retrieve_graph_contexts(question, rewritten)
-        top_contexts = self.fuse_contexts(vector_contexts, graph_contexts)
+        top_contexts = await self._retrieve_contexts(question, rewritten)
 
         answer_text, reasoning = await self.generate_answer(
             question,
@@ -126,22 +138,23 @@ class QAAgent:
         try:
             return await self._rewrite_query(question)
         except Exception:
-            return {"queries": [question], "entities": [], "keywords": []}
+            return {"question": question, "queries": [question], "entities": [], "keywords": []}
 
     async def retrieve_vector_contexts(self, question: str, rewritten: dict[str, Any]) -> list[RetrievedContext]:
         if not self.vector_retriever:
             return []
 
-        documents: list[Any] = []
-        queries = list(rewritten.get("queries", [])) or [question]
-        for query in queries:
-            try:
-                docs = await self.vector_retriever.ainvoke(query)
-            except Exception:
-                continue
-            if isinstance(docs, list):
-                documents.extend(docs)
-        return self._documents_to_contexts(documents)
+        payload = {
+            "question": question,
+            "queries": list(rewritten.get("queries", [])) or [question],
+            "entities": list(rewritten.get("entities", [])),
+            "keywords": list(rewritten.get("keywords", [])),
+        }
+        try:
+            documents = await self.vector_retriever.ainvoke(payload)
+        except Exception:
+            return []
+        return self._documents_to_contexts(documents if isinstance(documents, list) else [])
 
     async def retrieve_graph_contexts(self, question: str, rewritten: dict[str, Any]) -> list[RetrievedContext]:
         if not self.graph_retriever:
@@ -188,6 +201,28 @@ class QAAgent:
 
         unique.sort(key=lambda item: item.score, reverse=True)
         return unique[:8]
+
+    async def rerank_contexts(
+        self,
+        question: str,
+        rewritten: dict[str, Any],
+        vector_contexts: list[RetrievedContext],
+        graph_contexts: list[RetrievedContext],
+    ) -> list[RetrievedContext]:
+        merged = [*vector_contexts, *graph_contexts]
+        if not merged:
+            return []
+
+        payload = {
+            "question": question,
+            "queries": list(rewritten.get("queries", [])) or [question],
+            "entities": list(rewritten.get("entities", [])),
+            "keywords": list(rewritten.get("keywords", [])),
+        }
+        documents = self._contexts_to_documents(merged)
+        coarse_documents = self._dedupe_documents(documents)
+        reranked_documents = self.rerank_service.rerank_documents(payload, coarse_documents, top_k=8)
+        return self._documents_to_contexts(reranked_documents)
 
     async def generate_answer(
         self,
@@ -272,19 +307,25 @@ class QAAgent:
         except ValueError:
             return QueryIntent.FACTOID
 
-    async def _rewrite_query(self, question: str) -> dict:
-        rewritten = await self.query_understanding.rewrite_query(question)
-        queries = rewritten.queries or [question]
-        return {
-            "queries": queries,
-            "entities": rewritten.entities,
-            "keywords": rewritten.keywords,
-        }
+    async def _rewrite_query(self, question: str) -> dict[str, Any]:
+        return await self.query_understanding.build_retrieval_payload(question)
 
     async def _retrieve_contexts(self, question: str, rewritten: dict[str, Any]) -> list[RetrievedContext]:
+        if self.hybrid_retriever:
+            payload = {
+                "question": question,
+                "queries": list(rewritten.get("queries", [])) or [question],
+                "entities": list(rewritten.get("entities", [])),
+                "keywords": list(rewritten.get("keywords", [])),
+            }
+            try:
+                documents = await self.hybrid_retriever.ainvoke(payload)
+                return self._documents_to_contexts(documents if isinstance(documents, list) else [])
+            except Exception:
+                pass
         vector_contexts = await self.retrieve_vector_contexts(question, rewritten)
         graph_contexts = await self.retrieve_graph_contexts(question, rewritten)
-        return self.fuse_contexts(vector_contexts, graph_contexts)
+        return await self.rerank_contexts(question, rewritten, vector_contexts, graph_contexts)
 
     async def _generate_answer(
         self,
@@ -352,3 +393,32 @@ class QAAgent:
                 )
             )
         return contexts
+
+    @staticmethod
+    def _contexts_to_documents(contexts: list[RetrievedContext]) -> list[Document]:
+        documents: list[Document] = []
+        for context in contexts:
+            documents.append(
+                Document(
+                    page_content=context.content,
+                    metadata={
+                        **context.metadata,
+                        "source": context.source,
+                        "score": context.score,
+                        "retrieval_type": context.retrieval_type,
+                    },
+                )
+            )
+        return documents
+
+    @staticmethod
+    def _dedupe_documents(documents: list[Document]) -> list[Document]:
+        unique: list[Document] = []
+        seen: set[str] = set()
+        for document in documents:
+            key = document.page_content[:100]
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(document)
+        return unique

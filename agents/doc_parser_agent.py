@@ -235,6 +235,79 @@ class DocParserAgent:
                 lines.append(line)
         return "\n".join(lines)
 
+    @staticmethod
+    def _is_heading_line(line: str) -> tuple[int, str] | None:
+        markdown_heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if markdown_heading:
+            return len(markdown_heading.group(1)), markdown_heading.group(2).strip()
+
+        numbered_heading = re.match(r"^(第[一二三四五六七八九十百]+[章节部分]|\d+(?:\.\d+){0,2})[、.\s]+(.+)$", line)
+        if numbered_heading:
+            return 1, numbered_heading.group(2).strip()
+
+        return None
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        return line.count("|") >= 2
+
+    @staticmethod
+    def _is_list_line(line: str) -> bool:
+        return bool(re.match(r"^(\-|\*|\+|\d+\.)\s+\S+", line))
+
+    @staticmethod
+    def _chunk_metadata(
+        source: str,
+        doc_type: DocType,
+        section_title: str,
+        parent_section: str,
+        char_start: int,
+        content: str,
+    ) -> dict[str, Any]:
+        return {
+            "source": source,
+            "file_name": os.path.basename(source),
+            "section_title": section_title,
+            "parent_section": parent_section,
+            "doc_type": doc_type.value,
+            "char_start": char_start,
+            "char_end": char_start + len(content),
+        }
+
+    def _append_chunk(
+        self,
+        chunks: list[DocumentChunk],
+        *,
+        doc_id: str,
+        doc_type: DocType,
+        source: str,
+        idx: int,
+        content: str,
+        section_title: str,
+        parent_section: str,
+        char_start: int,
+    ) -> int:
+        content = content.strip()
+        if not content:
+            return idx
+        chunks.append(
+            DocumentChunk(
+                content=content,
+                doc_id=doc_id,
+                chunk_index=idx,
+                doc_type=doc_type,
+                metadata=self._chunk_metadata(
+                    source,
+                    doc_type,
+                    section_title,
+                    parent_section,
+                    char_start,
+                    content,
+                ),
+            )
+        )
+        return idx + 1
+
     def _split_long_block(self, block: str) -> list[str]:
         if len(block) <= self.CHUNK_SIZE:
             return [block]
@@ -251,6 +324,56 @@ class DocParserAgent:
             start = max(end - self.CHUNK_OVERLAP, start + 1)
         return parts
 
+    def _iter_structured_blocks(self, text: str) -> list[tuple[str, str, str, str]]:
+        blocks: list[tuple[str, str, str, str]] = []
+        section_stack: list[tuple[int, str]] = []
+        buffer: list[str] = []
+        buffer_type = "paragraph"
+        buffer_section = ""
+        buffer_parent = ""
+
+        def flush() -> None:
+            nonlocal buffer, buffer_type, buffer_section, buffer_parent
+            if buffer:
+                blocks.append(("\n".join(buffer).strip(), buffer_type, buffer_section, buffer_parent))
+                buffer = []
+
+        for line in text.split("\n"):
+            heading = self._is_heading_line(line)
+            if heading:
+                flush()
+                level, title = heading
+                while section_stack and section_stack[-1][0] >= level:
+                    section_stack.pop()
+                parent = section_stack[-1][1] if section_stack else ""
+                section_stack.append((level, title))
+                blocks.append((line.strip(), "heading", title, parent))
+                continue
+
+            current_section = section_stack[-1][1] if section_stack else ""
+            current_parent = section_stack[-2][1] if len(section_stack) >= 2 else ""
+            line_type = "table" if self._is_table_line(line) else "list" if self._is_list_line(line) else "paragraph"
+
+            if not buffer:
+                buffer = [line]
+                buffer_type = line_type
+                buffer_section = current_section
+                buffer_parent = current_parent
+                continue
+
+            if line_type != buffer_type:
+                flush()
+                buffer = [line]
+                buffer_type = line_type
+                buffer_section = current_section
+                buffer_parent = current_parent
+                continue
+
+            buffer.append(line)
+
+        flush()
+        return blocks
+
     def _chunk_texts(
         self,
         texts: list[str],
@@ -261,63 +384,87 @@ class DocParserAgent:
         chunks: list[DocumentChunk] = []
         idx = 0
         for text in texts:
-            blocks = [block.strip() for block in re.split(r"\n(?=#{1,6}\s)|\n", text) if block.strip()]
+            blocks = self._iter_structured_blocks(text)
             buffer = ""
             char_start = 0
+            buffer_section = ""
+            buffer_parent = ""
 
-            for block in blocks:
+            for block, _block_type, section_title, parent_section in blocks:
                 if len(block) > self.CHUNK_SIZE:
                     if buffer:
-                        chunks.append(DocumentChunk(
-                            content=buffer,
+                        idx = self._append_chunk(
+                            chunks,
                             doc_id=doc_id,
-                            chunk_index=idx,
                             doc_type=doc_type,
-                            metadata={"source": source, "char_start": char_start, "char_end": char_start + len(buffer)},
-                        ))
-                        idx += 1
+                            source=source,
+                            idx=idx,
+                            content=buffer,
+                            section_title=buffer_section,
+                            parent_section=buffer_parent,
+                            char_start=char_start,
+                        )
                         char_start += max(len(buffer) - self.CHUNK_OVERLAP, 1)
                         buffer = ""
+                        buffer_section = ""
+                        buffer_parent = ""
 
                     for part in self._split_long_block(block):
-                        chunks.append(DocumentChunk(
-                            content=part,
+                        idx = self._append_chunk(
+                            chunks,
                             doc_id=doc_id,
-                            chunk_index=idx,
                             doc_type=doc_type,
-                            metadata={"source": source, "char_start": char_start, "char_end": char_start + len(part)},
-                        ))
-                        idx += 1
+                            source=source,
+                            idx=idx,
+                            content=part,
+                            section_title=section_title,
+                            parent_section=parent_section,
+                            char_start=char_start,
+                        )
                         char_start += max(len(part) - self.CHUNK_OVERLAP, 1)
                     continue
 
                 candidate = f"{buffer}\n{block}".strip() if buffer else block
                 if len(candidate) <= self.CHUNK_SIZE:
                     buffer = candidate
+                    if section_title:
+                        buffer_section = section_title
+                    if parent_section:
+                        buffer_parent = parent_section
                     continue
 
                 if buffer:
-                    chunks.append(DocumentChunk(
-                        content=buffer,
+                    idx = self._append_chunk(
+                        chunks,
                         doc_id=doc_id,
-                        chunk_index=idx,
                         doc_type=doc_type,
-                        metadata={"source": source, "char_start": char_start, "char_end": char_start + len(buffer)},
-                    ))
-                    idx += 1
+                        source=source,
+                        idx=idx,
+                        content=buffer,
+                        section_title=buffer_section,
+                        parent_section=buffer_parent,
+                        char_start=char_start,
+                    )
                     overlap = buffer[-self.CHUNK_OVERLAP:].strip()
                     char_start += max(len(buffer) - len(overlap), 1)
                     buffer = f"{overlap}\n{block}".strip() if overlap else block
+                    buffer_section = section_title
+                    buffer_parent = parent_section
                 else:
                     buffer = block
+                    buffer_section = section_title
+                    buffer_parent = parent_section
 
             if buffer.strip():
-                chunks.append(DocumentChunk(
-                    content=buffer.strip(),
+                idx = self._append_chunk(
+                    chunks,
                     doc_id=doc_id,
-                    chunk_index=idx,
                     doc_type=doc_type,
-                    metadata={"source": source, "char_start": char_start, "char_end": char_start + len(buffer)},
-                ))
-                idx += 1
+                    source=source,
+                    idx=idx,
+                    content=buffer.strip(),
+                    section_title=buffer_section,
+                    parent_section=buffer_parent,
+                    char_start=char_start,
+                )
         return chunks

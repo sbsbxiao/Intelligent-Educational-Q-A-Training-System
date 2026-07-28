@@ -31,6 +31,25 @@ ANSWER_WITH_CONTEXT_PROMPT = """你是教育培训机构知识助手。请结合
 DIRECT_ANSWER_PROMPT = """你是教育培训机构知识助手。当前没有可用 RAG 上下文、工具结果或知识库资料。
 请直接基于大模型能力回答用户问题；如果问题需要机构内部资料，请明确说明当前缺少资料。"""
 
+PLAN_ANSWER_WITH_CONTEXT_PROMPT = """你是教育培训机构的方案设计助手。请基于检索上下文、工具结果和历史对话，为用户生成结构化、可执行的方案。
+
+回答要求：
+1. 重点输出结构化方案，而不是普通问答式回复。
+2. 优先给出清晰的阶段划分、步骤顺序、目标说明和执行建议。
+3. 如果上下文足够，尽量把方案写完整；如果上下文不足，明确指出哪些部分依据充分，哪些部分仍需补充信息。
+4. 不要编造机构内部事实、课程安排、政策细节或题库信息。
+5. 输出应强调可执行性、组织性和完整性，避免空泛表述。
+6. 如果适合，可自然组织为“目标 / 现状 / 分阶段方案 / 执行建议 / 风险与补充信息”这类结构。
+7. 如果引用了上下文内容，尽量保留来源感知。"""
+
+PLAN_DIRECT_ANSWER_PROMPT = """你是教育培训机构的方案设计助手。当前没有足够的知识库上下文、工具结果或内部资料。
+
+回答要求：
+1. 可以给出通用性的方案框架，但必须明确哪些内容只是通用建议。
+2. 如果问题依赖机构内部资料、课程资料、题库资料或政策资料，请明确说明当前缺少依据，无法给出高置信度的定制方案。
+3. 输出仍应保持结构化，优先给出可执行框架，而不是零散说明。
+4. 不要编造内部信息。"""
+
 
 @dataclass
 class EducationAgentResult:
@@ -66,8 +85,32 @@ class EducationAnswerGenerationChain:
                 "用户问题: {question}",
             ),
         ])
+        self.plan_answer_prompt = ChatPromptTemplate.from_messages([
+            ("system", PLAN_ANSWER_WITH_CONTEXT_PROMPT),
+            (
+                "human",
+                "请输出适合方案设计界面的最终结果。\n"
+                "问题类型/Skill: {skill_name}\n"
+                "工具调用: {tools_used}\n"
+                "上下文信息:\n{context_text}\n\n"
+                "历史对话:\n{history_text}\n\n"
+                "用户问题: {question}",
+            ),
+        ])
+        self.plan_direct_answer_prompt = ChatPromptTemplate.from_messages([
+            ("system", PLAN_DIRECT_ANSWER_PROMPT),
+            (
+                "human",
+                "请输出适合方案设计界面的最终结果。\n"
+                "问题类型/Skill: {skill_name}\n"
+                "历史对话:\n{history_text}\n\n"
+                "用户问题: {question}",
+            ),
+        ])
         self.answer_chain = self.answer_prompt | llm | parser
         self.direct_answer_chain = self.direct_answer_prompt | llm | parser
+        self.plan_answer_chain = self.plan_answer_prompt | llm | parser
+        self.plan_direct_answer_chain = self.plan_direct_answer_prompt | llm | parser
 
     async def generate(
         self,
@@ -77,6 +120,7 @@ class EducationAnswerGenerationChain:
         history_text: str,
         context_text: str,
         tools_used: list[str],
+        plan_mode: bool = False,
     ) -> str:
         payload = {
             "question": question,
@@ -85,6 +129,10 @@ class EducationAnswerGenerationChain:
             "context_text": context_text,
             "tools_used": ", ".join(tools_used) if tools_used else "无",
         }
+        if plan_mode:
+            if context_text:
+                return await self.plan_answer_chain.ainvoke(payload)
+            return await self.plan_direct_answer_chain.ainvoke(payload)
         if context_text:
             return await self.answer_chain.ainvoke(payload)
         return await self.direct_answer_chain.ainvoke(payload)
@@ -204,6 +252,8 @@ class EducationAgent:
         skill_name: str,
         skill_result: SkillResult,
         history_text: str = "",
+        *,
+        plan_mode: bool = False,
     ) -> str:
         context_text = self._format_context(skill_result)
         return await self.answer_generation.generate(
@@ -212,6 +262,7 @@ class EducationAgent:
             history_text=history_text,
             context_text=context_text,
             tools_used=skill_result.tools_used,
+            plan_mode=plan_mode,
         )
 
     def save_memory(
@@ -268,8 +319,16 @@ class EducationAgent:
         skill_name: str,
         skill_result: SkillResult,
         history_text: str = "",
+        *,
+        plan_mode: bool = False,
     ) -> str:
-        return await self.generate_final_answer(question, skill_name, skill_result, history_text)
+        return await self.generate_final_answer(
+            question,
+            skill_name,
+            skill_result,
+            history_text,
+            plan_mode=plan_mode,
+        )
 
     @staticmethod
     def _format_context(skill_result: SkillResult) -> str:
@@ -377,4 +436,5 @@ class EducationAgent:
             data=skill_result.data if isinstance(skill_result.data, dict) else {"result": skill_result.data},
             metadata=metadata,
         )
+
 

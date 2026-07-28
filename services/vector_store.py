@@ -57,6 +57,7 @@ class VectorStoreService:
         ids = [c.chunk_id for c in chunks]
         metadatas = [
             {
+                **c.metadata,
                 "doc_id": c.doc_id,
                 "doc_type": c.doc_type.value,
                 "source": c.metadata.get("source", ""),
@@ -136,4 +137,3 @@ class VectorStoreService:
             count = self._store.count()
             return {"backend": "chroma", "available": True, "total_vectors": count, "collection": self.collection_name}
         return {"backend": "pgvector", "available": True, "collection": self.collection_name}
-
