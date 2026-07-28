@@ -1,19 +1,13 @@
-"""
-GraphRAG 混合检索管道 — 向量检索 + 图谱遍历 + 重排序
+﻿"""
+GraphRAG 娣峰悎妫€绱㈢閬?鈥?鍚戦噺妫€绱?+ 鍥捐氨閬嶅巻 + 閲嶆帓搴?
+杩欐槸鏈」鐩殑鏍稿績鎶€鏈寒鐐逛箣涓€锛?  浼犵粺 RAG 鍙仛鍚戦噺妫€绱紝涓㈠け瀹炰綋闂寸殑缁撴瀯鍖栧叧绯?  GraphRAG 灏嗙煡璇嗗浘璋卞拰鍚戦噺妫€绱㈣瀺鍚堬紝瀹炵幇澶氳烦鎺ㄧ悊
 
-这是本项目的核心技术亮点之一：
-  传统 RAG 只做向量检索，丢失实体间的结构化关系
-  GraphRAG 将知识图谱和向量检索融合，实现多跳推理
-
-工作流:
-  Query → [向量检索分支] ────→ 合并 → 交叉重排序 → Top-K
-         [图谱检索分支] ────↗
-
-图谱检索策略:
-  1. 实体链接: 从 query 中识别实体 → 在图谱中定位
-  2. 子图召回: 从定位实体出发 N 跳遍历
-  3. 路径推理: 找到实体间的最短路径，提供推理链
-"""
+宸ヤ綔娴?
+  Query 鈫?[鍚戦噺妫€绱㈠垎鏀痌 鈹€鈹€鈹€鈹€鈫?鍚堝苟 鈫?浜ゅ弶閲嶆帓搴?鈫?Top-K
+         [鍥捐氨妫€绱㈠垎鏀痌 鈹€鈹€鈹€鈹€鈫?
+鍥捐氨妫€绱㈢瓥鐣?
+  1. 瀹炰綋閾炬帴: 浠?query 涓瘑鍒疄浣?鈫?鍦ㄥ浘璋变腑瀹氫綅
+  2. 瀛愬浘鍙洖: 浠庡畾浣嶅疄浣撳嚭鍙?N 璺抽亶鍘?  3. 璺緞鎺ㄧ悊: 鎵惧埌瀹炰綋闂寸殑鏈€鐭矾寰勶紝鎻愪緵鎺ㄧ悊閾?"""
 
 from __future__ import annotations
 
@@ -26,6 +20,7 @@ from langchain_openai import ChatOpenAI
 
 from config import settings
 from services.knowledge_graph import KnowledgeGraphService
+from services.token_usage import token_usage_service
 from services.vector_store import VectorStoreService
 
 
@@ -38,28 +33,20 @@ class GraphRAGContext:
 
 
 ENTITY_LINKING_PROMPT = """\
-从以下问题中提取所有可能的实体名称（人名、组织、技术、产品、概念等）。
-返回 JSON: {"entities": ["实体1", "实体2"]}
-只返回 JSON。
-"""
+浠庝互涓嬮棶棰樹腑鎻愬彇鎵€鏈夊彲鑳界殑瀹炰綋鍚嶇О锛堜汉鍚嶃€佺粍缁囥€佹妧鏈€佷骇鍝併€佹蹇电瓑锛夈€?杩斿洖 JSON: {"entities": ["瀹炰綋1", "瀹炰綋2"]}
+鍙繑鍥?JSON銆?"""
 
 COMMUNITY_SUMMARY_PROMPT = """\
-你是一个知识图谱分析专家。根据以下子图信息，生成一段结构化摘要。
-要求：
-1. 概述子图中的核心实体和关系
-2. 突出实体间的关键联系
-3. 指出任何有价值的推理链
-"""
+浣犳槸涓€涓煡璇嗗浘璋卞垎鏋愪笓瀹躲€傛牴鎹互涓嬪瓙鍥句俊鎭紝鐢熸垚涓€娈电粨鏋勫寲鎽樿銆?瑕佹眰锛?1. 姒傝堪瀛愬浘涓殑鏍稿績瀹炰綋鍜屽叧绯?2. 绐佸嚭瀹炰綋闂寸殑鍏抽敭鑱旂郴
+3. 鎸囧嚭浠讳綍鏈変环鍊肩殑鎺ㄧ悊閾?"""
 
 
 class GraphRAGPipeline:
     """
-    GraphRAG 混合检索管道
-
-    融合三种检索策略:
-      1. 向量语义检索 — 捕获语义相似内容
-      2. 图谱子图检索 — 通过实体关系进行结构化推理
-      3. 社区摘要检索 — 对子图进行摘要，提供高层概览
+    GraphRAG 娣峰悎妫€绱㈢閬?
+    铻嶅悎涓夌妫€绱㈢瓥鐣?
+      1. 鍚戦噺璇箟妫€绱?鈥?鎹曡幏璇箟鐩镐技鍐呭
+      2. 鍥捐氨瀛愬浘妫€绱?鈥?閫氳繃瀹炰綋鍏崇郴杩涜缁撴瀯鍖栨帹鐞?      3. 绀惧尯鎽樿妫€绱?鈥?瀵瑰瓙鍥捐繘琛屾憳瑕侊紝鎻愪緵楂樺眰姒傝
     """
 
     def __init__(
@@ -78,9 +65,7 @@ class GraphRAGPipeline:
 
     async def retrieve(self, query: str, top_k: int = 10) -> list[GraphRAGContext]:
         """
-        混合检索入口
-        并行执行向量检索和图谱检索，然后交叉重排序
-        """
+        娣峰悎妫€绱㈠叆鍙?        骞惰鎵ц鍚戦噺妫€绱㈠拰鍥捐氨妫€绱紝鐒跺悗浜ゅ弶閲嶆帓搴?        """
         vector_results = await self._vector_search(query, top_k=top_k)
         entities = await self._entity_linking(query)
         subgraph_results = await self._subgraph_search(entities)
@@ -95,7 +80,7 @@ class GraphRAGPipeline:
         reranked = self._cross_rerank(all_results, query)
         return reranked[:top_k]
 
-    # ── Step 1: 向量检索 ─────────────────────────────────────
+    # 鈹€鈹€ Step 1: 鍚戦噺妫€绱?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     async def _vector_search(self, query: str, top_k: int = 5) -> list[GraphRAGContext]:
         results = await self.vector_store.search(query, top_k=top_k)
@@ -109,7 +94,7 @@ class GraphRAGPipeline:
             for doc, score in results
         ]
 
-    # ── Step 2: 实体链接 ─────────────────────────────────────
+    # 鈹€鈹€ Step 2: 瀹炰綋閾炬帴 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     async def _entity_linking(self, query: str) -> list[str]:
         messages = [
@@ -126,7 +111,7 @@ class GraphRAGPipeline:
         except (json.JSONDecodeError, IndexError):
             return []
 
-    # ── Step 3: 子图检索 ─────────────────────────────────────
+    # 鈹€鈹€ Step 3: 瀛愬浘妫€绱?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     async def _subgraph_search(self, entities: list[str], hops: int = 2) -> list[GraphRAGContext]:
         contexts: list[GraphRAGContext] = []
@@ -148,10 +133,10 @@ class GraphRAGPipeline:
                 ))
         return contexts
 
-    # ── Step 4: 路径检索 ─────────────────────────────────────
+    # 鈹€鈹€ Step 4: 璺緞妫€绱?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     async def _path_search(self, entities: list[str]) -> list[GraphRAGContext]:
-        """查找实体对之间的最短路径，提供推理链"""
+        """鏌ユ壘瀹炰綋瀵逛箣闂寸殑鏈€鐭矾寰勶紝鎻愪緵鎺ㄧ悊閾?""
         if len(entities) < 2:
             return []
 
@@ -180,7 +165,7 @@ class GraphRAGPipeline:
                             if k < len(rels):
                                 path_str += f" --[{rels[k]}]--> "
                         contexts.append(GraphRAGContext(
-                            content=f"推理路径: {path_str}",
+                            content=f"鎺ㄧ悊璺緞: {path_str}",
                             source_type="path",
                             score=0.85,
                             metadata={"from": entities[i], "to": entities[j]},
@@ -189,14 +174,14 @@ class GraphRAGPipeline:
                     continue
         return contexts
 
-    # ── Step 5: 社区摘要 ─────────────────────────────────────
+    # 鈹€鈹€ Step 5: 绀惧尯鎽樿 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     async def _community_summary(self, subgraph_results: list[GraphRAGContext]) -> GraphRAGContext:
-        """对检索到的子图信息进行摘要"""
+        """瀵规绱㈠埌鐨勫瓙鍥句俊鎭繘琛屾憳瑕?""
         subgraph_text = "\n".join(r.content for r in subgraph_results[:20])
         messages = [
             SystemMessage(content=COMMUNITY_SUMMARY_PROMPT),
-            HumanMessage(content=f"子图信息:\n{subgraph_text}"),
+            HumanMessage(content=f"瀛愬浘淇℃伅:\n{subgraph_text}"),
         ]
         resp = await self.llm.ainvoke(messages)
         return GraphRAGContext(
@@ -206,16 +191,16 @@ class GraphRAGPipeline:
             metadata={"type": "community_summary"},
         )
 
-    # ── Step 6: 交叉重排序 ───────────────────────────────────
+    # 鈹€鈹€ Step 6: 浜ゅ弶閲嶆帓搴?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     @staticmethod
     def _cross_rerank(contexts: list[GraphRAGContext], query: str) -> list[GraphRAGContext]:
         """
-        交叉重排序策略:
-          - 向量检索: 基础分 × 1.0
-          - 子图检索: 基础分 × 1.15 (结构化信息更精准)
-          - 路径检索: 基础分 × 1.25 (推理链最有价值)
-          - 社区摘要: 基础分 × 1.1  (高层概览)
+        浜ゅ弶閲嶆帓搴忕瓥鐣?
+          - 鍚戦噺妫€绱? 鍩虹鍒?脳 1.0
+          - 瀛愬浘妫€绱? 鍩虹鍒?脳 1.15 (缁撴瀯鍖栦俊鎭洿绮惧噯)
+          - 璺緞妫€绱? 鍩虹鍒?脳 1.25 (鎺ㄧ悊閾炬渶鏈変环鍊?
+          - 绀惧尯鎽樿: 鍩虹鍒?脳 1.1  (楂樺眰姒傝)
         """
         weight_map = {"vector": 1.0, "subgraph": 1.15, "path": 1.25, "community": 1.1}
         for ctx in contexts:
@@ -231,3 +216,4 @@ class GraphRAGPipeline:
 
         unique.sort(key=lambda c: c.score, reverse=True)
         return unique
+

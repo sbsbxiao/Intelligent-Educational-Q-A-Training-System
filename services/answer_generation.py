@@ -3,12 +3,15 @@
 from collections.abc import Callable
 
 from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 
 from config import settings
+from services.token_usage import token_usage_service
 
 
 ANSWER_PROMPT = """你是一个专业的企业知识问答助手。请基于检索到的上下文回答用户问题。
@@ -108,3 +111,4 @@ class AnswerGenerationChain:
         if has_context:
             return await self.answer_chain.ainvoke(payload, config=config)
         return await self.direct_answer_chain.ainvoke(payload, config=config)
+

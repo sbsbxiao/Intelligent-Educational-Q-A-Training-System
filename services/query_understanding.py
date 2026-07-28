@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from config import settings
 from services.structured_output import QueryRewriteOutput, StructuredOutputAdapter
+from services.token_usage import token_usage_service
 
 
 class IntentClassificationOutput(BaseModel):
@@ -130,3 +131,4 @@ class QueryUnderstandingChains:
             seen.add(key)
             output.append(normalized)
         return output
+

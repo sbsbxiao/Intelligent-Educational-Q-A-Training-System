@@ -4,13 +4,17 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 from config import settings
 from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from services.knowledge_graph import KnowledgeGraphService
+from services.token_usage import token_usage_service
 from services.vector_store import VectorStoreService
 from skills.base import SkillResult
 from skills.course_explanation import CourseExplanationSkill
@@ -436,5 +440,6 @@ class EducationAgent:
             data=skill_result.data if isinstance(skill_result.data, dict) else {"result": skill_result.data},
             metadata=metadata,
         )
+
 
 

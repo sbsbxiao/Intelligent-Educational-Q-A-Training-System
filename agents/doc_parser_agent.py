@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from config import settings
+from services.token_usage import token_usage_service
 
 
 class DocType(str, Enum):
@@ -468,3 +469,4 @@ class DocParserAgent:
                     char_start=char_start,
                 )
         return chunks
+

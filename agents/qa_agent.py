@@ -18,6 +18,7 @@ from services.local_text_generation import create_local_text_generation_model
 from services.query_understanding import QueryUnderstandingChains
 from services.rerank import SharedRerankService
 from services.retrievers import GraphKnowledgeRetriever, HybridKnowledgeRetriever, VectorKnowledgeRetriever
+from services.token_usage import token_usage_service
 
 
 class QueryIntent(str, Enum):
@@ -422,3 +423,4 @@ class QAAgent:
             seen.add(key)
             unique.append(document)
         return unique
+
