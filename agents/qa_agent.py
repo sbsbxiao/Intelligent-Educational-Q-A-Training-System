@@ -18,7 +18,10 @@ from services.local_text_generation import create_local_text_generation_model
 from services.query_understanding import QueryUnderstandingChains
 from services.rerank import SharedRerankService
 from services.retrievers import GraphKnowledgeRetriever, HybridKnowledgeRetriever, VectorKnowledgeRetriever
-from services.token_usage import token_usage_service
+
+_MAX_GENERATION_CONTEXTS = 6
+_MAX_CONTEXT_ITEM_CHARS = 520
+_MAX_MEMORY_CONTEXT_CHARS = 700
 
 
 class QueryIntent(str, Enum):
@@ -127,7 +130,10 @@ class QAAgent:
         )
 
     def load_memory_context(self, session_id: str = DEFAULT_SESSION_ID) -> str:
-        return conversation_memory.format_memory_context(session_id=session_id)
+        return self._limit_text(
+            conversation_memory.format_memory_context(session_id=session_id),
+            _MAX_MEMORY_CONTEXT_CHARS,
+        )
 
     async def classify_intent(self, question: str) -> QueryIntent:
         try:
@@ -351,15 +357,17 @@ class QAAgent:
                 "答案生成完成",
             ]
 
+        selected_contexts = self._select_generation_contexts(contexts)
         context_text = "\n\n".join(
-            f"[来源 {i + 1}: {c.source} | 类型: {c.retrieval_type} | 分数: {c.score:.2f}]\n{c.content}"
-            for i, c in enumerate(contexts)
+            f"[来源 {i + 1}: {c.source} | 类型: {c.retrieval_type} | 分数: {c.score:.2f}]\n{self._limit_text(c.content, _MAX_CONTEXT_ITEM_CHARS)}"
+            for i, c in enumerate(selected_contexts)
         )
         reasoning_steps = [
             f"识别问题意图: {intent.value}",
             f"检索到 {len(contexts)} 条相关上下文",
-            f"向量检索: {sum(1 for c in contexts if c.retrieval_type == 'vector')} 条",
-            f"图谱检索: {sum(1 for c in contexts if c.retrieval_type == 'graph')} 条",
+            f"生成阶段使用 {len(selected_contexts)} 条上下文",
+            f"向量检索: {sum(1 for c in selected_contexts if c.retrieval_type == 'vector')} 条",
+            f"图谱检索: {sum(1 for c in selected_contexts if c.retrieval_type == 'graph')} 条",
         ]
 
         answer = await self.answer_generation.generate(
@@ -424,3 +432,27 @@ class QAAgent:
             unique.append(document)
         return unique
 
+    @staticmethod
+    def _select_generation_contexts(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+        selected: list[RetrievedContext] = []
+        per_type_limit = {"vector": 3, "graph": 3, "hybrid": 4}
+        type_counts: dict[str, int] = {}
+
+        for context in contexts:
+            if len(selected) >= _MAX_GENERATION_CONTEXTS:
+                break
+            context_type = context.retrieval_type
+            current = type_counts.get(context_type, 0)
+            if current >= per_type_limit.get(context_type, 3):
+                continue
+            selected.append(context)
+            type_counts[context_type] = current + 1
+
+        return selected or contexts[:_MAX_GENERATION_CONTEXTS]
+
+    @staticmethod
+    def _limit_text(text: str, max_chars: int) -> str:
+        cleaned = " ".join(str(text).split())
+        if max_chars <= 0 or len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "..."

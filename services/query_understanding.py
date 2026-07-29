@@ -10,23 +10,16 @@ from pydantic import BaseModel
 
 from config import settings
 from services.structured_output import QueryRewriteOutput, StructuredOutputAdapter
-from services.token_usage import token_usage_service
 
 
 class IntentClassificationOutput(BaseModel):
     intent: str = "factoid"
 
 
-INTENT_PROMPT = """你是一个查询意图分类器。根据用户问题识别最合适的意图类别。
-可选类别：factoid、analytical、comparative、procedural、exploratory。"""
+INTENT_PROMPT = """你是查询意图分类器。请把问题归类为 factoid、analytical、comparative、procedural、exploratory 之一。"""
 
-QUERY_REWRITE_PROMPT = """你是一个查询改写专家。将用户问题改写为更适合检索的形式。
-要求：
-1. 提取核心实体和关键词，保留课程名、章节名、题型名、机构名等关键标识。
-2. 生成 1-3 个检索查询，覆盖原问法、关键词问法、补全后的短语问法。
-3. 检索查询必须更适合向量检索和知识图谱检索，但不能偏离原问题语义。
-4. 不要编造不存在的事实，不要引入原问题中没有的新领域。
-5. 如果原问题已经很适合检索，至少保留原问题本身作为一个查询。"""
+QUERY_REWRITE_PROMPT = """你是查询改写助手。请输出更适合检索的查询、实体和关键词。
+要求：保留核心实体，不偏离原问题，不编造新事实；查询数量控制在 1-3 个。"""
 
 _VALID_INTENTS = {"factoid", "analytical", "comparative", "procedural", "exploratory"}
 
@@ -55,18 +48,25 @@ class QueryUnderstandingChains:
         self.rewrite_chain = self.rewrite_prompt | self.llm | RunnableLambda(self._parse_rewrite_message)
 
     async def classify_intent(self, question: str) -> str:
+        quick_intent = self._quick_classify_intent(question)
+        if quick_intent:
+            return quick_intent
+
         result = await self.intent_chain.ainvoke({
             "system_prompt": INTENT_PROMPT,
             "format_instructions": self.intent_parser.format_instructions(),
-            "question": question,
+            "question": self._limit_text(question, 220),
         })
         return result.intent
 
     async def rewrite_query(self, question: str) -> QueryRewriteOutput:
+        if self._should_skip_rewrite(question):
+            return self._build_lightweight_rewrite(question)
+
         rewritten = await self.rewrite_chain.ainvoke({
             "system_prompt": QUERY_REWRITE_PROMPT,
             "format_instructions": self.rewrite_parser.format_instructions(),
-            "question": question,
+            "question": self._limit_text(question, 280),
         })
         queries = self._dedupe_keep_order([question, *rewritten.queries])
         return QueryRewriteOutput(
@@ -132,3 +132,40 @@ class QueryUnderstandingChains:
             output.append(normalized)
         return output
 
+    @staticmethod
+    def _quick_classify_intent(question: str) -> str | None:
+        normalized = question.lower()
+        if any(token in normalized for token in ["对比", "区别", "不同", "哪个好"]):
+            return "comparative"
+        if any(token in normalized for token in ["步骤", "流程", "如何", "怎么", "怎么办"]):
+            return "procedural"
+        if any(token in normalized for token in ["原因", "为什么", "分析", "影响"]):
+            return "analytical"
+        if any(token in normalized for token in ["有哪些", "总结", "全面", "介绍"]):
+            return "exploratory"
+        if len(question.strip()) <= 18:
+            return "factoid"
+        return None
+
+    @staticmethod
+    def _should_skip_rewrite(question: str) -> bool:
+        compact = " ".join(question.split())
+        return len(compact) <= 24 and all(mark not in compact for mark in ["，", ",", "；", ";", "？", "?", "。"])
+
+    @classmethod
+    def _build_lightweight_rewrite(cls, question: str) -> QueryRewriteOutput:
+        compact = " ".join(question.split())
+        keywords = [part for part in cls._dedupe_keep_order(compact.replace("，", " ").replace("。", " ").split(" ")) if len(part) >= 2]
+        entities = [item for item in keywords if any(ch.isupper() for ch in item) or len(item) >= 4][:3]
+        return QueryRewriteOutput(
+            queries=[compact],
+            entities=entities,
+            keywords=keywords[:6],
+        )
+
+    @staticmethod
+    def _limit_text(text: str, max_chars: int) -> str:
+        cleaned = " ".join(str(text).split())
+        if max_chars <= 0 or len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "..."

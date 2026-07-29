@@ -3,15 +3,12 @@
 from collections.abc import Callable
 
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.messages import BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 
 from config import settings
-from services.token_usage import token_usage_service
 
 
 ANSWER_PROMPT = """你是一个专业的企业知识问答助手。请基于检索到的上下文回答用户问题。
@@ -32,6 +29,10 @@ DIRECT_ANSWER_PROMPT = """你是一个有帮助的智能助手。当前没有可
 2. 如果问题需要项目知识、企业内部资料、私有文档或明确依赖知识库检索，请直接说明当前缺少可用上下文，无法准确确认。
 3. 不要把猜测当成事实，不要伪造来源。
 4. 保持简洁、明确。"""
+
+_MAX_MEMORY_CONTEXT_CHARS = 700
+_MAX_CONTEXT_TEXT_CHARS = 3600
+_MAX_QUESTION_CHARS = 500
 
 
 class AnswerGenerationChain:
@@ -102,9 +103,9 @@ class AnswerGenerationChain:
         has_context: bool = True,
     ) -> str:
         payload = {
-            "question": question,
-            "memory_context": memory_context or "无",
-            "context_text": context_text,
+            "question": self._limit_text(question, _MAX_QUESTION_CHARS),
+            "memory_context": self._limit_text(memory_context or "无", _MAX_MEMORY_CONTEXT_CHARS),
+            "context_text": self._limit_text(context_text, _MAX_CONTEXT_TEXT_CHARS),
             "history": [],
         }
         config = {"configurable": {"session_id": session_id}}
@@ -112,3 +113,9 @@ class AnswerGenerationChain:
             return await self.answer_chain.ainvoke(payload, config=config)
         return await self.direct_answer_chain.ainvoke(payload, config=config)
 
+    @staticmethod
+    def _limit_text(text: str, max_chars: int) -> str:
+        cleaned = "\n".join(line.rstrip() for line in str(text).strip().splitlines() if line.strip())
+        if max_chars <= 0 or len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "..."

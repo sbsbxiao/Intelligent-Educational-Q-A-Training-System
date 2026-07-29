@@ -4,17 +4,14 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 from config import settings
 from services.conversation_memory import DEFAULT_SESSION_ID, conversation_memory
 from services.knowledge_graph import KnowledgeGraphService
-from services.token_usage import token_usage_service
 from services.vector_store import VectorStoreService
 from skills.base import SkillResult
 from skills.course_explanation import CourseExplanationSkill
@@ -53,6 +50,13 @@ PLAN_DIRECT_ANSWER_PROMPT = """你是教育培训机构的方案设计助手。�
 2. 如果问题依赖机构内部资料、课程资料、题库资料或政策资料，请明确说明当前缺少依据，无法给出高置信度的定制方案。
 3. 输出仍应保持结构化，优先给出可执行框架，而不是零散说明。
 4. 不要编造内部信息。"""
+
+_MAX_HISTORY_CHARS = 700
+_MAX_CONTEXT_CHARS = 2600
+_MAX_TOOL_RESULT_CHARS = 1800
+_MAX_TOOLS_USED = 4
+_MAX_SOURCE_ITEMS = 4
+_MAX_SOURCE_PREVIEW_CHARS = 240
 
 
 @dataclass
@@ -131,7 +135,7 @@ class EducationAnswerGenerationChain:
             "skill_name": skill_name,
             "history_text": history_text or "无",
             "context_text": context_text,
-            "tools_used": ", ".join(tools_used) if tools_used else "无",
+            "tools_used": ", ".join(tools_used[:_MAX_TOOLS_USED]) if tools_used else "无",
         }
         if plan_mode:
             if context_text:
@@ -215,9 +219,15 @@ class EducationAgent:
         return result
 
     def load_history(self, session_id: str = DEFAULT_SESSION_ID) -> str:
-        return conversation_memory.format_history_with_short_memory(session_id=session_id)
+        return self._limit_text(
+            conversation_memory.format_history_with_short_memory(session_id=session_id),
+            _MAX_HISTORY_CHARS,
+        )
 
     async def route_question(self, question: str, history_text: str = "") -> str:
+        routed_by_rules = self._route_by_rules_if_confident(question)
+        if routed_by_rules:
+            return routed_by_rules
         routed = await self.select_skill_with_llm(question, history_text)
         if self.is_valid_skill(routed):
             return routed
@@ -263,9 +273,9 @@ class EducationAgent:
         return await self.answer_generation.generate(
             question=question,
             skill_name=skill_name,
-            history_text=history_text,
+            history_text=self._limit_text(history_text, _MAX_HISTORY_CHARS),
             context_text=context_text,
-            tools_used=skill_result.tools_used,
+            tools_used=skill_result.tools_used[:_MAX_TOOLS_USED],
             plan_mode=plan_mode,
         )
 
@@ -339,14 +349,28 @@ class EducationAgent:
         parts: list[str] = []
 
         valid_sources = [source for source in skill_result.sources if source]
-        if valid_sources:
-            parts.append("来源信息:\n" + json.dumps(valid_sources[:5], ensure_ascii=False, default=str))
+        deduped_sources = EducationAgent._dedupe_sources(valid_sources)[:_MAX_SOURCE_ITEMS]
+        if deduped_sources:
+            compact_sources = [
+                {
+                    **source,
+                    "content": EducationAgent._limit_text(str(source.get("content", "")), _MAX_SOURCE_PREVIEW_CHARS),
+                }
+                for source in deduped_sources
+            ]
+            parts.append("来源信息:\n" + json.dumps(compact_sources, ensure_ascii=False, default=str))
 
         cleaned_data = EducationAgent._remove_empty_values(skill_result.data)
         if cleaned_data:
-            parts.append("工具结果:\n" + json.dumps(cleaned_data, ensure_ascii=False, default=str)[:4000])
+            parts.append(
+                "工具结果:\n"
+                + EducationAgent._limit_text(
+                    json.dumps(cleaned_data, ensure_ascii=False, default=str),
+                    _MAX_TOOL_RESULT_CHARS,
+                )
+            )
 
-        return "\n\n".join(parts).strip()
+        return EducationAgent._limit_text("\n\n".join(parts).strip(), _MAX_CONTEXT_CHARS)
 
     @staticmethod
     def _remove_empty_values(value: Any) -> Any:
@@ -371,7 +395,7 @@ class EducationAgent:
                     "Do not answer the question directly."
                 )
             ),
-            HumanMessage(content=f"历史对话:\n{history_text or '无'}\n\n当前问题: {question}"),
+            HumanMessage(content=f"历史对话:\n{self._limit_text(history_text or '无', 300)}\n\n当前问题: {self._limit_text(question, 200)}"),
         ])
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
@@ -379,6 +403,10 @@ class EducationAgent:
         return tool_calls[0].get("name", "")
 
     def _route_by_rules(self, question: str) -> str:
+        return self._route_by_rules_if_confident(question) or "course_explanation"
+
+    @staticmethod
+    def _route_by_rules_if_confident(question: str) -> str | None:
         normalized = question.lower()
 
         if any(k in normalized for k in ["题", "选项", "答案", "解析", "错题", "考点"]):
@@ -390,7 +418,10 @@ class EducationAgent:
         if any(k in normalized for k in ["请假", "作业", "报名", "证书", "课时", "退费", "课程安排"]):
             return "service_qa"
 
-        return "course_explanation"
+        if any(k in normalized for k in ["课程", "章节", "知识点", "教材", "讲解", "原理", "概念"]):
+            return "course_explanation"
+
+        return None
 
     def _register_tools(self) -> None:
         self._safe_register_tool(CourseMaterialSearchTool(self.vector_store))
@@ -441,5 +472,23 @@ class EducationAgent:
             metadata=metadata,
         )
 
+    @staticmethod
+    def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for source in sources:
+            source_name = str(source.get("source", source.get("file_name", ""))).strip()
+            content = str(source.get("content", "")).strip()
+            key = (source_name, content[:120])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(source)
+        return unique
 
-
+    @staticmethod
+    def _limit_text(text: str, max_chars: int) -> str:
+        cleaned = " ".join(str(text).split())
+        if max_chars <= 0 or len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "..."

@@ -16,6 +16,12 @@ from config import settings
 DEFAULT_SESSION_ID = "default"
 logger = logging.getLogger("agent_hub.conversation_memory")
 
+_MAX_RECENT_HISTORY_MESSAGES = 2
+_MAX_HISTORY_LINE_CHARS = 120
+_MAX_HISTORY_CONTEXT_CHARS = 220
+_MAX_SHORT_MEMORY_SUMMARY_CHARS = 320
+_MAX_LONG_MEMORY_SUMMARY_CHARS = 220
+
 
 LONG_MEMORY_SYSTEM_PROMPT = """
 你是对话长时记忆提炼器。请把一条历史问答大幅压缩成长期关键信息。
@@ -84,13 +90,13 @@ class ConversationMemoryStore:
         lines: list[str] = []
         for message in messages:
             role = "用户" if message.get("role") == "user" else "助手"
-            content = str(message.get("content", "")).strip()
+            content = self._limit_text(str(message.get("content", "")).strip(), _MAX_HISTORY_LINE_CHARS)
             if content:
                 lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
     def format_history_with_short_memory(self, session_id: str = DEFAULT_SESSION_ID) -> str:
-        history_text = self.format_history(session_id=session_id, max_messages=4)
+        history_text = self.format_history(session_id=session_id, max_messages=_MAX_RECENT_HISTORY_MESSAGES)
         long_memory_text = self.format_long_memory_summary(session_id=session_id)
         short_memory_text = self.format_short_memory_summary(session_id=session_id)
         parts: list[str] = []
@@ -100,11 +106,11 @@ class ConversationMemoryStore:
             parts.append(f"短时记忆摘要:\n{short_memory_text}")
         if history_text:
             parts.append(f"最近历史对话:\n{history_text}")
-        return "\n\n".join(parts)
+        return self._limit_text("\n\n".join(parts), 700)
 
     def build_history_context(self, session_id: str = DEFAULT_SESSION_ID) -> dict[str, str]:
         return {
-            "recent_history": self.format_history(session_id=session_id, max_messages=4),
+            "recent_history": self.format_history(session_id=session_id, max_messages=_MAX_RECENT_HISTORY_MESSAGES),
             "short_memory": self.format_short_memory_summary(session_id=session_id),
             "long_memory": self.format_long_memory_summary(session_id=session_id),
         }
@@ -118,7 +124,7 @@ class ConversationMemoryStore:
             parts.append(f"短时记忆摘要:\n{context['short_memory']}")
         if context["recent_history"]:
             parts.append(f"最近历史摘要:\n{context['recent_history']}")
-        return "\n\n".join(parts)
+        return self._limit_text("\n\n".join(parts), 700)
 
     def get_message_history(self, session_id: str = DEFAULT_SESSION_ID) -> "JsonFileChatMessageHistory":
         return JsonFileChatMessageHistory(store=self, session_id=session_id)
@@ -165,19 +171,19 @@ class ConversationMemoryStore:
     def append_short_memory(self, item: dict[str, Any], session_id: str = DEFAULT_SESSION_ID) -> None:
         self._append_memory_item(self.short_memory_file_path, session_id, item, settings.max_short_memory_items)
 
-    def format_short_memory_summary(self, session_id: str = DEFAULT_SESSION_ID, max_chars: int = 500) -> str:
+    def format_short_memory_summary(self, session_id: str = DEFAULT_SESSION_ID, max_chars: int = _MAX_SHORT_MEMORY_SUMMARY_CHARS) -> str:
         memories = self.load_short_memories(session_id=session_id)[-settings.max_short_memory_items:]
         parts: list[str] = []
         for item in memories:
-            question = str(item.get("question", "")).strip()
-            answer = str(item.get("answer", "")).strip()
+            question = self._limit_text(str(item.get("question", "")).strip(), 80)
+            answer = self._limit_text(str(item.get("answer", "")).strip(), 120)
             if question or answer:
                 parts.append(f"问：{question}；答：{answer}")
         return self._limit_text("；".join(parts), max_chars)
 
-    def format_long_memory_summary(self, session_id: str = DEFAULT_SESSION_ID, max_chars: int = 300) -> str:
+    def format_long_memory_summary(self, session_id: str = DEFAULT_SESSION_ID, max_chars: int = _MAX_LONG_MEMORY_SUMMARY_CHARS) -> str:
         memories = self.load_long_memories(session_id=session_id)[-settings.max_long_memory_items:]
-        parts = [str(item.get("memory", "")).strip() for item in memories if str(item.get("memory", "")).strip()]
+        parts = [self._limit_text(str(item.get("memory", "")).strip(), 80) for item in memories if str(item.get("memory", "")).strip()]
         return self._limit_text("；".join(parts), max_chars)
 
     def format_short_memory(self, session_id: str = DEFAULT_SESSION_ID) -> str:
@@ -345,8 +351,8 @@ class ConversationMemoryStore:
                     "memory_index": index + 1,
                     "created_at": now,
                     "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-                    "question": question[:300],
-                    "answer": answer[:500],
+                    "question": question[:220],
+                    "answer": answer[:320],
                 })
         return memories or ConversationMemoryStore._fallback_short_memories(records)
 
@@ -359,8 +365,8 @@ class ConversationMemoryStore:
                 "memory_index": index,
                 "created_at": now,
                 "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-                "question": str(record.get("question", ""))[:300],
-                "answer": str(record.get("answer", ""))[:500],
+                "question": str(record.get("question", ""))[:220],
+                "answer": str(record.get("answer", ""))[:320],
             })
         return memories
 
@@ -380,14 +386,14 @@ class ConversationMemoryStore:
             "source_turn_index": record.get("turn_index"),
             "created_at": now,
             "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-            "memory": memory[:300],
+            "memory": memory[:220],
         }
 
     @staticmethod
     def _fallback_long_memory(record: dict[str, Any]) -> dict[str, Any]:
         now = int(time.time())
-        question = str(record.get("question", ""))[:120]
-        answer = str(record.get("answer", ""))[:160]
+        question = str(record.get("question", ""))[:90]
+        answer = str(record.get("answer", ""))[:120]
         return {
             "source_turn_index": record.get("turn_index"),
             "created_at": now,
