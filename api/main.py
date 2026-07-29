@@ -14,6 +14,7 @@ from agents.knowledge_update_agent import ChangeType, DocumentChange
 from config import settings
 from orchestrator.graph import build_knowledge_graph_workflow
 from services.knowledge_graph import KnowledgeGraphService
+from services.token_usage import token_usage_service
 from services.vector_store import VectorStoreService
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -67,6 +68,16 @@ class QuestionRequest(BaseModel):
     question: str
 
 
+class TokenUsageResponse(BaseModel):
+    task_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cached_tokens: int
+    reasoning_tokens: int
+    llm_calls: int
+
+
 class QuestionResponse(BaseModel):
     question: str
     answer: str
@@ -74,6 +85,7 @@ class QuestionResponse(BaseModel):
     intent: str
     sources: list[dict[str, Any]]
     reasoning_steps: list[str]
+    token_usage: TokenUsageResponse
 
 
 class EducationQuestionRequest(BaseModel):
@@ -86,6 +98,7 @@ class EducationQuestionResponse(BaseModel):
     skill: str
     tools_used: list[str]
     sources: list[dict[str, Any]]
+    token_usage: TokenUsageResponse
 
 
 class IngestResponse(BaseModel):
@@ -174,10 +187,12 @@ async def ask_question(req: QuestionRequest):
     if not qa_wf:
         raise HTTPException(status_code=503, detail="QA workflow not initialized")
 
-    result = await qa_wf.ainvoke({"question": req.question})
+    with token_usage_service.task_scope(scene="qa") as token_task:
+        result = await qa_wf.ainvoke({"question": req.question})
     qa_result = result.get("result")
     if not qa_result:
         raise HTTPException(status_code=500, detail="QA failed")
+    token_snapshot = token_usage_service.get_snapshot(token_task.task_id) or token_task
 
     return QuestionResponse(
         question=qa_result.question,
@@ -189,6 +204,15 @@ async def ask_question(req: QuestionRequest):
             for c in qa_result.contexts
         ],
         reasoning_steps=qa_result.reasoning_steps,
+        token_usage=TokenUsageResponse(
+            task_id=token_snapshot.task_id,
+            prompt_tokens=token_snapshot.prompt_tokens,
+            completion_tokens=token_snapshot.completion_tokens,
+            total_tokens=token_snapshot.total_tokens,
+            cached_tokens=token_snapshot.cached_tokens,
+            reasoning_tokens=token_snapshot.reasoning_tokens,
+            llm_calls=token_snapshot.llm_calls,
+        ),
     )
 
 
@@ -198,10 +222,12 @@ async def ask_education_question(req: EducationQuestionRequest):
     if not education_wf:
         raise HTTPException(status_code=503, detail="Education workflow not initialized")
 
-    result = await education_wf.ainvoke({"question": req.question})
+    with token_usage_service.task_scope(scene="education") as token_task:
+        result = await education_wf.ainvoke({"question": req.question})
     education_result = result.get("result")
     if not education_result:
         raise HTTPException(status_code=500, detail="Education QA failed")
+    token_snapshot = token_usage_service.get_snapshot(token_task.task_id) or token_task
 
     return EducationQuestionResponse(
         question=education_result.question,
@@ -209,6 +235,15 @@ async def ask_education_question(req: EducationQuestionRequest):
         skill=education_result.skill,
         tools_used=education_result.tools_used,
         sources=education_result.sources,
+        token_usage=TokenUsageResponse(
+            task_id=token_snapshot.task_id,
+            prompt_tokens=token_snapshot.prompt_tokens,
+            completion_tokens=token_snapshot.completion_tokens,
+            total_tokens=token_snapshot.total_tokens,
+            cached_tokens=token_snapshot.cached_tokens,
+            reasoning_tokens=token_snapshot.reasoning_tokens,
+            llm_calls=token_snapshot.llm_calls,
+        ),
     )
 
 
@@ -255,6 +290,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("api.main:app", host=settings.api_host, port=settings.api_port, reload=True)
-
-
-
