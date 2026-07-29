@@ -1101,6 +1101,55 @@ button {
   gap: 12px;
 }
 
+.token-usage-panel {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--light-blue);
+}
+
+.token-usage-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.token-usage-header strong {
+  color: var(--navy);
+}
+
+.token-usage-header span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.token-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.token-usage-item {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  background: white;
+  border: 1px solid var(--border);
+}
+
+.token-usage-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.token-usage-item strong {
+  color: var(--navy);
+  font-size: 18px;
+}
+
 @media (max-width: 900px) {
   body {
     min-width: 0;
@@ -1181,7 +1230,8 @@ button {
   .admin-detail-grid,
   .question-layout,
   .graph-layout,
-  .plan-form {
+  .plan-form,
+  .token-usage-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1196,6 +1246,11 @@ button {
   .table-row {
     grid-template-columns: minmax(180px, 1fr) repeat(4, minmax(86px, auto));
     overflow-x: auto;
+  }
+
+  .token-usage-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 

@@ -109,11 +109,21 @@ export function PlanPage() {
               <strong>Sources</strong>
               <span>{result.sources.length} 条</span>
             </div>
+            <div className="meta-row">
+              <strong>Token Total</strong>
+              <span>{result.token_usage.total_tokens}</span>
+            </div>
+            <div className="meta-row">
+              <strong>Prompt / Completion</strong>
+              <span>{result.token_usage.prompt_tokens} / {result.token_usage.completion_tokens}</span>
+            </div>
+            <div className="meta-row">
+              <strong>LLM Calls</strong>
+              <span>{result.token_usage.llm_calls}</span>
+            </div>
           </div>
         )}
       </div>
     </section>
   );
 }
-
-

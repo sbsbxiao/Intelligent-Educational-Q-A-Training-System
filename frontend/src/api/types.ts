@@ -1,4 +1,4 @@
-export type ApiState<T> = {
+﻿export type ApiState<T> = {
   loading: boolean;
   data: T | null;
   error: string;
@@ -8,12 +8,23 @@ export type EducationAskRequest = {
   question: string;
 };
 
+export type TokenUsage = {
+  task_id: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  reasoning_tokens: number;
+  llm_calls: number;
+};
+
 export type EducationAskResponse = {
   question: string;
   answer: string;
   skill: string;
   tools_used: string[];
   sources: Record<string, unknown>[];
+  token_usage: TokenUsage;
 };
 
 export type QaAskRequest = {
@@ -27,6 +38,7 @@ export type QaAskResponse = {
   intent: string;
   sources: Record<string, unknown>[];
   reasoning_steps: string[];
+  token_usage: TokenUsage;
 };
 
 export type IngestResponse = {
