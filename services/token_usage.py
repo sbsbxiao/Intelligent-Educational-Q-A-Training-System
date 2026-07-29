@@ -1,9 +1,12 @@
 ﻿from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
 from threading import Lock
 from typing import Any
 from uuid import uuid4
@@ -19,6 +22,7 @@ class TokenUsageSnapshot:
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     llm_calls: int = 0
+    model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -36,6 +40,7 @@ class _TaskUsageState:
         total_tokens: int = 0,
         cached_tokens: int = 0,
         reasoning_tokens: int = 0,
+        model: str = "",
     ) -> None:
         self.snapshot.prompt_tokens += max(prompt_tokens, 0)
         self.snapshot.completion_tokens += max(completion_tokens, 0)
@@ -43,6 +48,132 @@ class _TaskUsageState:
         self.snapshot.cached_tokens += max(cached_tokens, 0)
         self.snapshot.reasoning_tokens += max(reasoning_tokens, 0)
         self.snapshot.llm_calls += 1
+        if model and not self.snapshot.model:
+            self.snapshot.model = model
+
+
+class TokenUsageStorage:
+    """Persist token usage details and hourly aggregates to local files."""
+
+    def __init__(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        self._detail_dir = project_root / "logs" / "token_usage"
+        self._hourly_dir = project_root / "logs" / "token_usage_hourly"
+        self._lock = Lock()
+
+    def persist_snapshot(self, snapshot: TokenUsageSnapshot) -> None:
+        now = datetime.now()
+        detail_record = self._build_record(snapshot, now)
+        hourly_record = self._build_record(snapshot, now)
+
+        with self._lock:
+            self._detail_dir.mkdir(parents=True, exist_ok=True)
+            self._hourly_dir.mkdir(parents=True, exist_ok=True)
+            self._append_detail_record(detail_record)
+            self._update_hourly_record(hourly_record)
+
+    def _append_detail_record(self, record: dict[str, Any]) -> None:
+        detail_path = self._detail_dir / f"{record['date']}.jsonl"
+        with detail_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _update_hourly_record(self, record: dict[str, Any]) -> None:
+        hourly_path = self._hourly_dir / f"{record['date']}.json"
+        if hourly_path.exists():
+            with hourly_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+        else:
+            payload = {"date": record["date"], "hours": {}}
+
+        hour_key = record["hour"]
+        current = payload.setdefault("hours", {}).get(
+            hour_key,
+            {
+                "date": record["date"],
+                "hour": hour_key,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "llm_calls": 0,
+                "tasks": 0,
+                "scenes": {},
+                "models": {},
+            },
+        )
+
+        current["prompt_tokens"] += record["prompt_tokens"]
+        current["completion_tokens"] += record["completion_tokens"]
+        current["total_tokens"] += record["total_tokens"]
+        current["cached_tokens"] += record["cached_tokens"]
+        current["reasoning_tokens"] += record["reasoning_tokens"]
+        current["llm_calls"] += record["llm_calls"]
+        current["tasks"] += 1
+
+        scene_entry = current.setdefault("scenes", {}).get(
+            record["scene"],
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "llm_calls": 0,
+                "tasks": 0,
+            },
+        )
+        scene_entry["prompt_tokens"] += record["prompt_tokens"]
+        scene_entry["completion_tokens"] += record["completion_tokens"]
+        scene_entry["total_tokens"] += record["total_tokens"]
+        scene_entry["cached_tokens"] += record["cached_tokens"]
+        scene_entry["reasoning_tokens"] += record["reasoning_tokens"]
+        scene_entry["llm_calls"] += record["llm_calls"]
+        scene_entry["tasks"] += 1
+        current["scenes"][record["scene"]] = scene_entry
+
+        model_key = record["model"] or "unknown"
+        model_entry = current.setdefault("models", {}).get(
+            model_key,
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "llm_calls": 0,
+                "tasks": 0,
+            },
+        )
+        model_entry["prompt_tokens"] += record["prompt_tokens"]
+        model_entry["completion_tokens"] += record["completion_tokens"]
+        model_entry["total_tokens"] += record["total_tokens"]
+        model_entry["cached_tokens"] += record["cached_tokens"]
+        model_entry["reasoning_tokens"] += record["reasoning_tokens"]
+        model_entry["llm_calls"] += record["llm_calls"]
+        model_entry["tasks"] += 1
+        current["models"][model_key] = model_entry
+
+        payload["hours"][hour_key] = current
+        with hourly_path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _build_record(snapshot: TokenUsageSnapshot, now: datetime) -> dict[str, Any]:
+        return {
+            "timestamp": now.isoformat(timespec="seconds"),
+            "date": now.strftime("%Y-%m-%d"),
+            "hour": now.strftime("%H"),
+            "task_id": snapshot.task_id,
+            "scene": snapshot.scene,
+            "prompt_tokens": snapshot.prompt_tokens,
+            "completion_tokens": snapshot.completion_tokens,
+            "total_tokens": snapshot.total_tokens,
+            "cached_tokens": snapshot.cached_tokens,
+            "reasoning_tokens": snapshot.reasoning_tokens,
+            "llm_calls": snapshot.llm_calls,
+            "model": snapshot.model,
+        }
 
 
 class TokenUsageService:
@@ -52,6 +183,7 @@ class TokenUsageService:
         self._current_task_id: ContextVar[str | None] = ContextVar("token_usage_task_id", default=None)
         self._task_store: dict[str, _TaskUsageState] = {}
         self._lock = Lock()
+        self._storage = TokenUsageStorage()
 
     def start_task(self, scene: str, task_id: str | None = None) -> TokenUsageSnapshot:
         resolved_task_id = task_id or f"{scene}_{uuid4().hex[:12]}"
@@ -83,6 +215,7 @@ class TokenUsageService:
         total_tokens: int = 0,
         cached_tokens: int = 0,
         reasoning_tokens: int = 0,
+        model: str = "",
         task_id: str | None = None,
     ) -> TokenUsageSnapshot | None:
         resolved_task_id = task_id or self._current_task_id.get()
@@ -99,6 +232,7 @@ class TokenUsageService:
                 total_tokens=total_tokens,
                 cached_tokens=cached_tokens,
                 reasoning_tokens=reasoning_tokens,
+                model=model,
             )
             return TokenUsageSnapshot(**state.snapshot.to_dict())
 
@@ -128,10 +262,12 @@ class TokenUsageService:
         if not resolved_task_id:
             return None
         with self._lock:
-            state = self._task_store.get(resolved_task_id)
+            state = self._task_store.pop(resolved_task_id, None)
             snapshot = TokenUsageSnapshot(**state.snapshot.to_dict()) if state else None
         if self._current_task_id.get() == resolved_task_id:
             self._current_task_id.set(None)
+        if snapshot:
+            self._storage.persist_snapshot(snapshot)
         return snapshot
 
     @contextmanager
@@ -148,7 +284,7 @@ class TokenUsageService:
                 self._current_task_id.set(existing_task_id)
 
     @staticmethod
-    def _extract_usage(message: Any) -> dict[str, int] | None:
+    def _extract_usage(message: Any) -> dict[str, Any] | None:
         usage_metadata = getattr(message, "usage_metadata", None) or {}
         response_metadata = getattr(message, "response_metadata", None) or {}
         token_usage = response_metadata.get("token_usage", {}) if isinstance(response_metadata, dict) else {}
@@ -180,6 +316,7 @@ class TokenUsageService:
             output_details.get("reasoning"),
             completion_details.get("reasoning_tokens"),
         )
+        model = TokenUsageService._coerce_str(response_metadata.get("model_name")) if isinstance(response_metadata, dict) else ""
 
         if total_tokens <= 0 and prompt_tokens <= 0 and completion_tokens <= 0:
             return None
@@ -190,6 +327,7 @@ class TokenUsageService:
             "total_tokens": total_tokens,
             "cached_tokens": cached_tokens,
             "reasoning_tokens": reasoning_tokens,
+            "model": model,
         }
 
     @staticmethod
@@ -202,6 +340,12 @@ class TokenUsageService:
             if isinstance(value, float):
                 return int(value)
         return 0
+
+    @staticmethod
+    def _coerce_str(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        return ""
 
 
 token_usage_service = TokenUsageService()
